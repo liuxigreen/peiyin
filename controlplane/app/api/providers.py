@@ -53,20 +53,51 @@ def set_default(provid: str, db: Session = Depends(get_db)):
 
 @router.post("/{provid}/test")
 async def test_provider(provid: str, db: Session = Depends(get_db)):
-    """真实连通性测试：OpenAI兼容 /v1/models 探测；DeepL查usage。"""
+    """真实连通性测试：发一条最小chat请求（验证key+模型名+端点三者）。
+    MiniMax等平台无/models路由，chat探测是唯一可靠的验证方式。"""
+    import time
     from ..core.crypto import decrypt_key
     p = db.get(m.TranslationProvider, provid)
+    if not p:
+        raise HTTPException(404, "provider not found")
+    key = decrypt_key(p.api_key_encrypted) if p.api_key_encrypted else ""
+    base = (p.api_base_url or "").rstrip("/")
+    t0 = time.time()
     try:
-        key = decrypt_key(p.api_key_encrypted) if p.api_key_encrypted else ""
-        base = (p.api_base_url or "").rstrip("/")
         if p.provider_type == "deepl":
-            async with httpx.AsyncClient(timeout=10) as c:
+            async with httpx.AsyncClient(timeout=15) as c:
                 r = await c.get(f"https://api-free.deepl.com/v2/usage",
                                 headers={"Authorization": f"DeepL-Auth-Key {key}"})
-        else:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(f"{base}/models",
-                                headers={"Authorization": f"Bearer {key}"})
-        return {"ok": r.status_code == 200, "status": r.status_code}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
+            ok = r.status_code == 200
+            return {"ok": ok, "status": r.status_code,
+                    "latency_ms": int((time.time() - t0) * 1000),
+                    "error": None if ok else f"HTTP {r.status_code}"}
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(f"{base}/chat/completions",
+                             headers={"Authorization": f"Bearer {key}",
+                                      "Content-Type": "application/json"},
+                             json={"model": p.model_name or "gpt-3.5-turbo",
+                                   "messages": [{"role": "user",
+                                                 "content": "Reply with exactly: PONG"}],
+                                   "max_tokens": 16, "temperature": 0})
+        latency = int((time.time() - t0) * 1000)
+        if r.status_code == 200:
+            try:
+                text = (r.json()["choices"][0]["message"].get("content") or "").strip()
+            except Exception:                               # noqa: BLE001
+                text = ""
+            return {"ok": bool(text), "status": 200, "latency_ms": latency,
+                    "model": p.model_name,
+                    "sample": text[:60],
+                    "error": None if text else "200但无回复内容，检查模型名"}
+        detail = ""
+        try:
+            detail = r.json().get("error", {}).get("message", "") or str(r.json())[:150]
+        except Exception:                                   # noqa: BLE001
+            detail = r.text[:150]
+        return {"ok": False, "status": r.status_code, "latency_ms": latency,
+                "error": f"HTTP {r.status_code}: {detail}"}
+    except Exception as e:                                  # noqa: BLE001
+        return {"ok": False, "status": 0,
+                "latency_ms": int((time.time() - t0) * 1000),
+                "error": str(e)[:200]}

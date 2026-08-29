@@ -104,3 +104,20 @@ def test_power_status_api(tmp_path):
     assert st["dry_run"] is True and st["instance_on"] is False
     tick = c.post("/api/power/tick").json()
     assert "gpu_backlog" in tick
+
+
+def test_provider_test_endpoint_structure(tmp_path):
+    """测连通：chat探测（非/models）。假key→ok=false+结构化error；不存在的id→404。
+    用不可达地址避免真实外网依赖。"""
+    c = _client(str(tmp_path / "pt.db"))
+    c.post("/api/providers", json={
+        "name": "unreachable", "provider_type": "custom_openai_compatible",
+        "api_base_url": "http://127.0.0.1:9", "api_key": "sk-fake",
+        "model_name": "whatever"})
+    provs = c.get("/api/providers").json()
+    t = [p for p in provs if p["name"] == "unreachable"][0]
+    r = c.post(f"/api/providers/{t['id']}/test").json()
+    assert r["ok"] is False and r["status"] == 0 and r["error"], r
+    assert "latency_ms" in r
+    r404 = c.post("/api/providers/nonexistent/test")
+    assert r404.status_code == 404
