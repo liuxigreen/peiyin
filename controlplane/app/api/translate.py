@@ -15,8 +15,9 @@ from ..translate_executor import (execute_translate_task,
 router = APIRouter(prefix="/api", tags=["translate"])
 
 
-_SRT_TIME = re.compile(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*"
-                       r"\d{2}:\d{2}:\d{2}[,.]\d{3}")
+_SRT_TIME = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*"
+    r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})")
 
 
 def _parse_srt(text: str) -> list[dict]:
@@ -38,11 +39,12 @@ def _parse_srt(text: str) -> list[dict]:
         m = _SRT_TIME.search(tline)
         if not m:
             continue
-        h, mi, s, ms = (int(x) for x in m.groups())
+        h, mi, s, ms, h2, mi2, s2, ms2 = (int(x) for x in m.groups())
         body = " ".join(lines[i + 1:]).strip()
         if body:
+            # 评审D6修复：end_ms读SRT真实结束时间（原+2000写死使fit窗口失真）
             entries.append({"start_ms": ((h * 60 + mi) * 60 + s) * 1000 + ms,
-                            "end_ms": body and ((h * 60 + mi) * 60 + s) * 1000 + ms + 2000,
+                            "end_ms": ((h2 * 60 + mi2) * 60 + s2) * 1000 + ms2,
                             "text": body})
     return entries
 

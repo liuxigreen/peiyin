@@ -117,7 +117,9 @@ def test_provider_test_endpoint_structure(tmp_path):
     provs = c.get("/api/providers").json()
     t = [p for p in provs if p["name"] == "unreachable"][0]
     r = c.post(f"/api/providers/{t['id']}/test").json()
-    assert r["ok"] is False and r["status"] == 0 and r["error"], r
+    # 连接失败本质：ok=False且error非空。status因网络环境而异
+    # (直连=0连接错误；走代理可能503/502)——不锁具体值
+    assert r["ok"] is False and r["error"], r
     assert "latency_ms" in r
     r404 = c.post("/api/providers/nonexistent/test")
     assert r404.status_code == 404

@@ -33,5 +33,15 @@ def presign_get(key: str, expires: int = 86400) -> str:
     return client.generate_presigned_url("get_object",
         Params={"Bucket": BUCKET, "Key": key}, ExpiresIn=expires)
 
+def r2_client():
+    """Multipart等高级操作用的S3 client（未配凭证时抛错，调用方自行降级）。"""
+    import boto3
+    from botocore.client import Config
+    return boto3.client(
+        "s3", endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY, aws_secret_access_key=R2_SECRET_KEY,
+        config=Config(signature_version="s3v4"), region_name="auto")
+
+
 def object_key(project_id: str, *parts) -> str:
     return f"projects/{project_id}/" + "/".join(parts)

@@ -142,11 +142,19 @@ def mux_video(video: str, dub_audio: str, out_path: str, ass_path: str | None = 
                   f":offset={m.get('target_offset', '0')}:linear=true")
         except KeyError:
             af = "loudnorm=I=-16:TP=-1.5:LRA=11"   # 测量缺字段→退单遍动态
-    args = ["-i", video, "-i", dub_audio]
-    vf = []
+    # ass滤镜跨平台：Windows盘符(C:\x\y.ass→C\:/x/y.ass)会被滤镜解析炸。
+    # 方案：chdir到ass所在目录，滤镜只传纯文件名（评审报告D1修复）
+    ass_bare = None
+    prev_cwd = None
     if ass_path:
-        ass_esc = ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-        vf.append(f"ass={ass_esc}")
+        ass_path = os.path.abspath(ass_path)
+        prev_cwd = os.getcwd()
+        os.chdir(os.path.dirname(ass_path))
+        ass_bare = os.path.basename(ass_path)
+    args = ["-i", os.path.abspath(video), "-i", os.path.abspath(dub_audio)]
+    vf = []
+    if ass_bare:
+        vf.append(f"ass={ass_bare}")
     if vf:
         args += ["-vf", ",".join(vf)]
     args += ["-map", "0:v:0", "-map", "1:a:0", "-c:v", vcodec, "-crf", str(crf),
@@ -154,8 +162,12 @@ def mux_video(video: str, dub_audio: str, out_path: str, ass_path: str | None = 
              "-movflags", "+faststart", "-shortest"]
     if af:
         args += ["-af", af]
-    args.append(out_path)
-    _run(args, timeout=1800)
+    args.append(os.path.abspath(out_path))
+    try:
+        _run(args, timeout=1800)
+    finally:
+        if prev_cwd is not None:
+            os.chdir(prev_cwd)   # 无论成败都恢复工作目录
     return out_path
 
 

@@ -1,6 +1,5 @@
 fastapi>=0.115
 uvicorn[standard]
-celery[redis]>=5.4
 sqlalchemy>=2.0
 psycopg[binary]
 alembic

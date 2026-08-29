@@ -26,8 +26,27 @@ def heartbeat_loop():
             print("[hb] offline:", e)
         time.sleep(60)
 
+def _task_heartbeat_loop(tid: str, stop: list):
+    """D2修复：任务执行期间每60s续租（防长任务ProPainter被reaper误杀）"""
+    import time as _t
+    while not stop[0]:
+        _t.sleep(60)
+        if stop[0]:
+            break
+        try:
+            httpx.post(f"{CONTROL}/api/nodes/tasks/{tid}/heartbeat",
+                       headers={"Authorization": f"Bearer {state['token']}"},
+                       timeout=10)
+        except Exception as e:
+            print("[task-hb] fail:", e)
+
+
 def dispatch(task: dict):
     tid, ttype = task["id"], task["task_type"]
+    stop_flag = [False]
+    import threading
+    hb = threading.Thread(target=_task_heartbeat_loop, args=(tid, stop_flag), daemon=True)
+    hb.start()
     try:
         from stages.router import run_task     # G0后实装：按type分发到stages/*
         outputs = run_task(task)
@@ -41,6 +60,8 @@ def dispatch(task: dict):
                    headers={"Authorization": f"Bearer {state['token']}"},
                    json={"error": str(e)[:400], "retryable": retryable})
         print(f"[fail] {ttype} {tid[:8]}: {e}")
+    finally:
+        stop_flag[0] = True   # 停任务心跳线程
 
 def main():
     register()

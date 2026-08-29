@@ -11,6 +11,27 @@ app = FastAPI(title="Dubbing Platform Control Plane", version="0.3.0")
 # 建表幂等且廉价：导入时执行一次，TestClient/uvicorn两种启动方式都成立
 init_db()
 
+# ── D4修复：API全局鉴权中间件 ──────────────────────────────
+# API_TOKEN未配置=开发模式（本机/Mac联调跳过）；配置后所有 /api/* 必带
+# Authorization: Bearer <token>。Caddy basic_auth之后的第二道闸。
+import os as _os
+from fastapi import Request as _Request
+from fastapi.responses import JSONResponse as _JSONResponse
+
+API_TOKEN = _os.getenv("API_TOKEN", "")
+
+
+@app.middleware("http")
+async def api_token_guard(request: _Request, call_next):
+    if API_TOKEN and request.url.path.startswith("/api"):
+        # 节点协议有自己的token体系(_auth_node)，不重复拦
+        if request.url.path.startswith("/api/nodes"):
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {API_TOKEN}":
+            return _JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
 
 @app.get("/health")
 def health():
