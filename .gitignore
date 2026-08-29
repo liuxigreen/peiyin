@@ -1,0 +1,29 @@
+# --- secrets / 本地状态 ---
+.env
+.env.*
+*.env
+!deploy/env.example
+controlplane/.env
+deploy/.env.r2
+
+# --- 数据库与本地运行产物 ---
+*.db
+*.sqlite
+dev.db
+workdir/
+storage/
+/tmp/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# --- Node ---
+node_modules/
+dist/
+
+# --- 系统 ---
+.DS_Store

@@ -1,0 +1,5 @@
+httpx>=0.27
+soundfile>=0.12
+numpy<2
+# G0时启用：
+# funasr onnxruntime htdemucs cosyvoice paddlex...

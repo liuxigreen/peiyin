@@ -1,0 +1,17 @@
+fastapi>=0.115
+uvicorn[standard]
+celery[redis]>=5.4
+sqlalchemy>=2.0
+psycopg[binary]
+alembic
+pydantic-settings
+cryptography          # provider api_key AES-GCM加密
+httpx
+python-multipart      # 文件上传
+soundfile
+librosa               # 音节/时长/WSOLA计算侧
+pyloudnorm
+jinja2
+numpy
+soundfile
+imageio-ffmpeg         # 静态ffmpeg二进制（render.py渲染链用，零系统依赖）

@@ -1,0 +1,20 @@
+# 计算节点镜像。基础层含CUDA+torch+模型运行时，变更频率低
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3-pip ffmpeg sox libsndfile1 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir torch==2.3.0 torchaudio==2.3.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# AI依赖层（G0后按需启用的真模型 deps；先装协议必需）
+COPY gpunode/requirements.txt /tmp/r.txt
+RUN pip3 install --no-cache-dir -r /tmp/r.txt
+
+WORKDIR /node
+COPY gpunode/ /node/
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python3", "entrypoint.py"]

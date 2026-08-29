@@ -1,0 +1,36 @@
+version: "3.9"
+services:
+  caddy:
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    environment:
+      DUBBING_BASIC_USER: ${DUBBING_BASIC_USER}
+      DUBBING_BASIC_PASSWORD_HASH: ${DUBBING_BASIC_PASSWORD_HASH}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+
+  controlplane:
+    build: { context: .., dockerfile: deploy/Dockerfile.control }
+    environment:
+      DATABASE_URL: postgresql://dubbing:${DB_PASSWORD}@db:5432/dubbing
+      API_TOKEN: ${API_TOKEN}
+      NODE_SHARED_SECRET: ${NODE_SHARED_SECRET}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID}
+      R2_ACCESS_KEY: ${R2_ACCESS_KEY}
+      R2_SECRET_KEY: ${R2_SECRET_KEY}
+      R2_BUCKET: dubbing
+    depends_on: [db]
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dubbing
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: dubbing
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    # 仅内部网络，不映射宿主端口
+
+volumes:
+  caddy-data:
+  pg-data:
