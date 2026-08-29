@@ -1,4 +1,4 @@
-const BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8500'
+const BASE = import.meta.env.VITE_API_BASE || ''   // 默认同源：云端/Mac本地通吃
 export const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false'
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
