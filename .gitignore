@@ -23,7 +23,8 @@ venv/
 
 # --- Node ---
 node_modules/
-dist/
+frontend/dist/
+# controlplane/web/dist 保留：云端部署即含前端构建产物
 
 # --- 系统 ---
 .DS_Store
