@@ -65,9 +65,13 @@ def test_mode_b_e2e(tmp_path):
     assert all(c["text"] for c in man["clips"])
 
 
-def test_mode_b_requires_audio(tmp_path):
+def test_mode_b_pure_translate_without_audio(tmp_path):
+    """无音频=纯翻译模式：200完成，clips=0，附补传提示。"""
     c = _client(str(tmp_path / "mb2.db"))
     pid = c.post("/api/projects", json={"name": "B", "target_lang": "en"}).json()["id"]
     c.post(f"/api/projects/{pid}/seed-srt", json={"srt": _SRT})
     r = c.post(f"/api/projects/{pid}/mode-b/run")
-    assert r.status_code == 400   # 没登记音频→400
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["clips"] == 0
+    assert "补传配音" in body["note"]
