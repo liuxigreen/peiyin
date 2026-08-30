@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from .db.session import init_db
-from .api import nodes, upload, projects, providers, assets, tasks, translate, agents
+from .api import nodes, upload, projects, providers, assets, tasks, translate, agents, mode_b_api
 
 app = FastAPI(title="Dubbing Platform Control Plane", version="0.3.0")
 
@@ -46,6 +46,7 @@ app.include_router(upload.router)
 app.include_router(tasks.router)
 app.include_router(translate.router)
 app.include_router(agents.router)
+app.include_router(mode_b_api.router)
 
 # Web面板构建产物静态托管（frontend/dist 拷贝到 controlplane/web/dist）
 # 挂在最后，且只匹配非 /api /docs 路径 —— SPA fallback用自定义异常处理
