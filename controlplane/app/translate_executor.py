@@ -162,6 +162,16 @@ def build_ctx_pack(db: Session, project: Project, utts: list[Utterance]) -> dict
 
 
 # ── 五步链主流程 ───────────────────────────────────────────
+_LANG_NAME = {"en": "English", "ja": "日本語", "ko": "한국어", "es": "Español",
+              "pt": "Português", "id": "Bahasa Indonesia", "th": "ไทย",
+              "vi": "Tiếng Việt", "ms": "Bahasa Melayu", "zh": "中文"}
+
+def _lang_rule(lang: str) -> str:
+    """硬约束输出语种（M3等模型会偷偷输出中文润色版——必须显式禁止）"""
+    name = _LANG_NAME.get(lang, lang)
+    return (f"【铁律】你的输出必须全部是{lang}({name})，一个汉字都不允许出现。"
+            f"即使原文是中文，你也只能输出{name}翻译。")
+
 _R1_SYS = ("你是影视字幕直译员。逐行翻译编号台词，保持行号格式 'N | 译文'。"
            "直译即可，忠实原文，术语表里的词必须用指定译法。")
 _R2_SYS = ("你是影视配音译者。基于第一轮直译做意译：口语自然、符合角色人设、"
@@ -186,19 +196,32 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
     gloss = "\n".join(f"- {k} → {v}" for k, v in ctx["glossary"].items()) or "（无）"
     cards = "；".join(c["role_name"] for c in ctx["role_cards"]) or "（未标注）"
 
-    r1 = await chat(provider, _R1_SYS,
-                    f"目标语种:{ctx['target_lang']}\n术语表:\n{gloss}\n台词:\n" + "\n".join(lines))
+    lang_rule = _lang_rule(ctx["target_lang"])
+    r1 = await chat(provider, f"{_R1_SYS}\n{lang_rule}",
+                    f"术语表:\n{gloss}\n台词:\n" + "\n".join(lines))
     t1 = _parse_numbered(r1, len(utts))
 
     prev3 = "\n".join(l.split("|", 1)[-1].strip() for l in r1.splitlines()[-3:])
-    r2 = await chat(provider, _R2_SYS,
+    r2 = await chat(provider, f"{_R2_SYS}\n{lang_rule}",
                     f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
                     f"第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(utts))))
     t2 = _parse_numbered(r2, len(utts))
 
-    rv = await chat(provider, _RV_SYS,
+    rv = await chat(provider, f"{_RV_SYS}\n{lang_rule}",
                     "全部台词终检:\n" + "\n".join(f"{i+1} | {t2[i+1]}" for i in range(len(utts))))
     t3 = _parse_numbered(rv, len(utts))
+
+    # 语种校验兜底：目标语非中文时，译文含中文比例>30%=翻译失败，整体重试一次
+    import re as _re
+    target_is_zh = ctx["target_lang"].startswith("zh")
+    def _zh_ratio(s: str) -> float:
+        if not s: return 0.0
+        return len(_re.findall(r"[\u4e00-\u9fff]", s)) / max(len(s), 1)
+    if not target_is_zh:
+        zh_bad = sum(1 for i in range(len(utts)) if _zh_ratio(t3[i+1]) > 0.3)
+        if zh_bad > len(utts) * 0.3:
+            raise RuntimeError(
+                f"译文语种校验失败：{zh_bad}/{len(utts)}句含中文，LLM未遵守目标语种约束")
 
     # T214 落库（version化：已有译文则version+1）
     written = 0
