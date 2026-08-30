@@ -61,8 +61,7 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
     if not p:
         raise HTTPException(404)
     audio_path = (p.config or {}).get("mode_b_audio")
-    if not audio_path or not os.path.exists(audio_path):
-        raise HTTPException(400, "中文配音音频未登记或不存在（先POST mode-b/upload-audio）")
+    has_audio = bool(audio_path and os.path.exists(audio_path))
     utts = (db.query(Utterance).filter_by(project_id=pid)
               .order_by(Utterance.seq_index).all())
     if not utts:
@@ -72,10 +71,10 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
     out_dir = os.path.join(work, "package")
     os.makedirs(out_dir, exist_ok=True)
 
-    # B2 槽位
+    # B2 槽位（无音频时跳过——纯翻译模式）
     entries = [{"uid": u.uid, "start_ms": u.start_ms, "end_ms": u.end_ms}
                for u in utts]
-    slots = audio_slots(audio_path, entries, os.path.join(work, "zh_refs"))
+    slots = audio_slots(audio_path, entries, os.path.join(work, "zh_refs")) if has_audio else []
     # B3 翻译（五步链，live provider；含语种校验兜底）
     scenes = sorted({(u.uid or "SC01").split("-")[0] for u in utts})
     tr_results = []
@@ -89,16 +88,20 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
         latest[t.utterance_id] = t
     translations = {u.uid: (latest[u.id].text if u.id in latest else "")
                     for u in utts}
-    # B4 TTS（降级占位；GPU/Confucius4接入后替换）
-    fitted = tts_clips_mock(slots, p.target_lang, os.path.join(work, "dub"))
-    # B6 交付包
-    qc = {"syllable_over": sum(1 for r in tr_results for k in [r] if r.get("over_limit")),
-          "translations": len(translations),
-          "slots_out_of_audio": sum(1 for s in slots if not s["within_audio"])}
-    pkg = build_package({"id": pid, "name": p.name, "target_lang": p.target_lang},
-                        entries, translations, fitted, out_dir, qc)
-    return {"ok": True, "package": pkg, "clips": len(fitted),
-            "scenes_translated": len(tr_results), "mode": "B"}
+    # B4/B6：有音频才生成TTS与交付包；无音频=纯翻译模式（音频后补再run一次出包）
+    if has_audio:
+        fitted = tts_clips_mock(slots, p.target_lang, os.path.join(work, "dub"))
+        qc = {"syllable_over": sum(1 for r in tr_results for k in [r] if r.get("over_limit")),
+              "translations": len(translations),
+              "slots_out_of_audio": sum(1 for s in slots if not s["within_audio"])}
+        pkg = build_package({"id": pid, "name": p.name, "target_lang": p.target_lang},
+                            entries, translations, fitted, out_dir, qc)
+        return {"ok": True, "package": pkg, "clips": len(fitted),
+                "scenes_translated": len(tr_results), "mode": "B",
+                "translations": translations}
+    return {"ok": True, "mode": "B", "translations": translations,
+            "clips": 0, "note": "纯翻译完成；补传配音后再次run即可生成交付包",
+            "scenes_translated": len(tr_results)}
 
 
 @router.get("/projects/{pid}/mode-b/package")
