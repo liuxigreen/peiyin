@@ -41,6 +41,8 @@ def _parse_srt(text: str) -> list[dict]:
             continue
         h, mi, s, ms, h2, mi2, s2, ms2 = (int(x) for x in m.groups())
         body = " ".join(lines[i + 1:]).strip()
+        # 剥离SRT内嵌HTML标签（<b>/<i>/<font>等——白月光实测发现大量<b>残留）
+        body = re.sub(r"</?[a-zA-Z][^>]*>", "", body).strip()
         if body:
             # 评审D6修复：end_ms读SRT真实结束时间（原+2000写死使fit窗口失真）
             entries.append({"start_ms": ((h * 60 + mi) * 60 + s) * 1000 + ms,
