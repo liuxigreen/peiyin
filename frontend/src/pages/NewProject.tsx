@@ -29,7 +29,7 @@ export default function NewProject() {
     setBusy(true)
     try {
       const p = await api.post<{ id: string }>('/api/projects',
-        { name: name.trim(), target_lang: lang })
+        { name: name.trim(), target_lang: lang, mode })
       const pid = p.id
       if (mode === 'B') {
         await api.post(`/api/projects/${pid}/seed-srt`,

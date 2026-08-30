@@ -11,7 +11,8 @@ def create_project(body: dict, db: Session = Depends(get_db)):
     proj = m.Project(name=body["name"],
                      target_lang=body.get("target_lang", "en"),
                      status="created",
-                     config={"filename": body.get("filename", "")})
+                     config={"filename": body.get("filename", ""),
+                             "mode": body.get("mode", "")})
     db.add(proj); db.commit()
     return {"id": proj.id, "name": proj.name, "status": proj.status}
 

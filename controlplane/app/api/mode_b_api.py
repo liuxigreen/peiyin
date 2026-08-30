@@ -62,6 +62,10 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
         raise HTTPException(404)
     audio_path = (p.config or {}).get("mode_b_audio")
     has_audio = bool(audio_path and os.path.exists(audio_path))
+    cfg0 = dict(p.config or {})
+    cfg0["mode"] = "B"
+    p.config = cfg0
+    db.commit()
     utts = (db.query(Utterance).filter_by(project_id=pid)
               .order_by(Utterance.seq_index).all())
     if not utts:
