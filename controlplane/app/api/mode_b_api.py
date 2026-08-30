@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from ..db.models import Project, Translation, Utterance
@@ -30,6 +30,27 @@ async def upload_audio_info(pid: str, body: dict, db: Session = Depends(get_db))
     p.config = cfg
     db.commit()
     return {"ok": True}
+
+
+@router.post("/projects/{pid}/mode-b/upload-file")
+async def upload_audio_file(pid: str, file: UploadFile = File(...),
+                            db: Session = Depends(get_db)):
+    """模式B：浏览器直接上传中文配音音频（multipart→本地STORAGE）。"""
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    os.makedirs(STORAGE, exist_ok=True)
+    dest_dir = os.path.join(STORAGE, pid[:8])
+    os.makedirs(dest_dir, exist_ok=True)
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    dest = os.path.join(dest_dir, f"zh_audio{suffix}")
+    with open(dest, "wb") as f:
+        f.write(await file.read())
+    cfg = dict(p.config or {})
+    cfg["mode_b_audio"] = dest
+    p.config = cfg
+    db.commit()
+    return {"ok": True, "path": dest, "size": os.path.getsize(dest)}
 
 
 @router.post("/projects/{pid}/mode-b/run")
