@@ -72,24 +72,34 @@ async def test_provider(provid: str, db: Session = Depends(get_db)):
             return {"ok": ok, "status": r.status_code,
                     "latency_ms": int((time.time() - t0) * 1000),
                     "error": None if ok else f"HTTP {r.status_code}"}
-        async with httpx.AsyncClient(timeout=20) as c:
+        async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(f"{base}/chat/completions",
                              headers={"Authorization": f"Bearer {key}",
                                       "Content-Type": "application/json"},
+                             # max_tokens=256：思考模型(M3/o1类)会把小预算全吃进reasoning
                              json={"model": p.model_name or "gpt-3.5-turbo",
                                    "messages": [{"role": "user",
                                                  "content": "Reply with exactly: PONG"}],
-                                   "max_tokens": 16, "temperature": 0})
+                                   "max_tokens": 256, "temperature": 0})
         latency = int((time.time() - t0) * 1000)
         if r.status_code == 200:
             try:
-                text = (r.json()["choices"][0]["message"].get("content") or "").strip()
+                msg = r.json()["choices"][0]["message"]
+                text = (msg.get("content") or "").strip()
             except Exception:                               # noqa: BLE001
                 text = ""
-            return {"ok": bool(text), "status": 200, "latency_ms": latency,
+            # 思考模型可能把回答放进reasoning_content——有reasoning=模型活着
+            reasoning = ""
+            try:
+                reasoning = (r.json()["choices"][0]["message"]
+                             .get("reasoning_content") or "")
+            except Exception:                               # noqa: BLE001
+                pass
+            alive = bool(text) or bool(reasoning)
+            return {"ok": alive, "status": 200, "latency_ms": latency,
                     "model": p.model_name,
-                    "sample": text[:60],
-                    "error": None if text else "200但无回复内容，检查模型名"}
+                    "sample": (text or f"[思考模型] {reasoning[:40]}")[:60],
+                    "error": None if alive else "200但无回复内容，检查模型名"}
         detail = ""
         try:
             detail = r.json().get("error", {}).get("message", "") or str(r.json())[:150]
