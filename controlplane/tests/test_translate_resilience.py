@@ -156,3 +156,29 @@ def test_fallback_provider_rescue(tmp_path, monkeypatch):
     trig = [u for u in utts if u["original"] == _TRIGGER][0]
     assert trig["translated"], trig          # 被保底救回，未隔离
     assert not trig["translated"].startswith("[MISSING"), trig
+
+
+def test_parallel_runner_scenes(tmp_path, monkeypatch):
+    """并行runner：多场景并发跑完，单场景失败不拖垮其他场景。"""
+    c = _client(str(tmp_path / "r5.db"))
+    pid = c.post("/api/projects", json={"name": "并行剧", "target_lang": "en"}).json()["id"]
+    srt4 = _SRT.replace("00:00:0", "00:0{:02d},".format(0))
+    c.post(f"/api/projects/{pid}/seed-srt",
+           json={"srt": _SRT + """\n5\n00:00:09,000 --> 00:00:10,000
+第二场景的台词
+
+6\n00:00:11,000 --> 00:00:12,000
+再来一句
+""", "scene_size": 4})
+
+    async def _stub(cfg, system, user):
+        return te._mock_translate(user)
+
+    monkeypatch.setattr(te, "chat", _stub)
+    import asyncio
+    from app.translate_executor import run_translate_project
+    results = asyncio.run(run_translate_project(pid, ["SC01", "SC02"], workers=2))
+    by_sc = {r["scene"]: r for r in results}
+    assert by_sc["SC01"]["status"] == "completed"
+    assert by_sc["SC02"]["status"] == "completed"
+    assert by_sc["SC01"]["utterances"] == 4 and by_sc["SC02"]["utterances"] == 2

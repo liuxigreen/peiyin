@@ -43,6 +43,39 @@ class ContentFilteredError(RuntimeError):
     """网关内容审查拒绝。输入决定的结果——重试无意义，由上层二分隔离。"""
 
 
+class _RateLimiter:
+    """全局调用节奏器：把每provider的调用间隔精确排开（用户实测M3限10次/分）。
+    持锁等待=排队效果，所有并发worker共享同一节奏，从源头消灭429盲等。"""
+
+    def __init__(self, per_min: float):
+        self._interval = 60.0 / max(per_min, 0.1)
+        self._lock = asyncio.Lock()
+        self._next_t = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            if self._next_t > now:
+                await asyncio.sleep(self._next_t - now)
+                now = loop.time()
+            self._next_t = max(now, self._next_t) + self._interval
+
+
+_LIMITERS: dict[str, _RateLimiter] = {}
+
+
+def _get_limiter(provider_name: str) -> _RateLimiter | None:
+    """MiniMax-M3 限 9 次/分（默认，env TRANSLATE_RATE_PER_MIN 可调）；其他provider不限。"""
+    if "minimax-m3" not in (provider_name or "").lower():
+        return None
+    if provider_name not in _LIMITERS:
+        import os
+        rate = float(os.getenv("TRANSLATE_RATE_PER_MIN", "9"))
+        _LIMITERS[provider_name] = _RateLimiter(rate)
+    return _LIMITERS[provider_name]
+
+
 # ── 音节估算（V3 §1.2 语种路由）─────────────────────────────
 _VOWEL_GROUPS = re.compile(r"[aeiouyàáèéìíòóùúãẽĩõũ]+", re.I)
 _KANA = re.compile(r"[\u3040-\u30ff]")
@@ -154,6 +187,9 @@ async def chat(cfg: dict, system: str, user: str) -> str:
             log.warning("429 backoff %ss (attempt %d)", wait, attempt)
             await asyncio.sleep(wait)
         try:
+            lim = _get_limiter(cfg["name"])
+            if lim:
+                await lim.acquire()
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
                 r = await c.post(f"{cfg['base']}/chat/completions",
                                  headers=headers, json=payload)
@@ -308,7 +344,9 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
         log.warning("R1 parse incomplete (%d/%d) chunk=%s — retry once",
                     sum(1 for v in t1.values() if _is_ph(v)), len(chunk),
                     utts[chunk[0]].uid)
-        t1b = _parse_numbered(await chat(provider, f"{_R1_SYS}\n{lang_rule}",
+        t1b = _parse_numbered(await chat(provider, f"{_R1_SYS}\n{lang_rule}\n"
+                                         "注意：只输出 'N | 译文' 格式的行，"
+                                         "不要任何解释、前言或多余文本。",
                                          f"术语表:\n{gloss}\n台词:\n" + "\n".join(lines)),
                               len(chunk))
         _merge(t1, t1b)
@@ -323,7 +361,9 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
         log.warning("R2 parse incomplete (%d/%d) chunk=%s — retry once",
                     sum(1 for v in t2.values() if _is_ph(v)), len(chunk),
                     utts[chunk[0]].uid)
-        t2b = _parse_numbered(await chat(provider, f"{_R2_SYS}\n{lang_rule}",
+        t2b = _parse_numbered(await chat(provider, f"{_R2_SYS}\n{lang_rule}\n"
+                                         "注意：只输出 'N | 译文' 格式的行，"
+                                         "不要任何解释、前言或多余文本。",
                                          f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
                                          + _budget_block(chunk, budget)
                                          + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk)))),
@@ -528,6 +568,36 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
             "filtered_chunks": stats["filtered_chunks"],
             "fallback_used": stats["fallback_used"],
             "compression_rounds": rounds}
+
+
+async def run_translate_project(project_id: str, scenes: list[str],
+                                workers: int = 4) -> list[dict]:
+    """场景级并行翻译（v0.6）：workers个并发、每个worker独立DB会话；
+    M3限速器全局共享（贴着9次/分跑满），429从源头消失。
+    返回逐场景结果；单场景失败不影响其他场景。"""
+    import time as _time
+    from .db.session import SessionLocal as _SL
+    sem = asyncio.Semaphore(max(1, workers))
+
+    async def _one(sc: str) -> dict:
+        async with sem:
+            db = _SL()
+            try:
+                project = db.get(Project, project_id)
+                t0 = _time.time()
+                info = await run_translate_scene(db, project, sc)
+                info["seconds"] = round(_time.time() - t0, 1)
+                log.info("scene %s done: utts=%s isolated=%s fallback=%s %.0fs",
+                        sc, info.get("utterances"), len(info.get("isolated", [])),
+                        info.get("fallback_used"), info.get("seconds", 0))
+                return {"scene": sc, "status": "completed", **info}
+            except Exception as e:                                 # noqa: BLE001
+                log.exception("scene %s failed", sc)
+                return {"scene": sc, "status": "failed", "error": str(e)[:300]}
+            finally:
+                db.close()
+
+    return list(await asyncio.gather(*[_one(sc) for sc in scenes]))
 
 
 async def execute_translate_task(db: Session, task: PipelineTask) -> dict:

@@ -6,7 +6,8 @@ from sqlalchemy.orm import sessionmaker
 from .models import Base
 
 url = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
-connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+connect_args = ({"check_same_thread": False, "timeout": 30}
+                if url.startswith("sqlite") else {})
 engine = create_engine(url, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
