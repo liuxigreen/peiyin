@@ -500,7 +500,8 @@ def _write_translation(db: Session, u: Utterance, target_lang: str, text: str,
 async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
                           utts: list[Utterance], part: list[int],
                           written: dict[int, dict], budget: dict[int, int] | None,
-                          target: str, limit: float, ctx: dict) -> bool:
+                          target: str, limit: float, ctx: dict,
+                          model_tag: str | None = None) -> bool:
     """一轮压缩：把超限行压缩到预算内，写新版本（没变短不写）。
     返回 False=被内容审查拒绝（上层换下一兜底模型重试）。"""
     lines, pairs = [], []
@@ -523,7 +524,8 @@ async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
         new_ratio = syllable_ratio(new_text, _src_of(utts[idx]), target)
         if new_ratio >= written[idx]["ratio"]:
             continue                             # 没变短，不值得+1版本
-        _write_translation(db, utts[idx], target, new_text, new_ratio, ctx, provider, limit)
+        _write_translation(db, utts[idx], target, new_text, new_ratio, ctx,
+                           {**provider, "model": model_tag or provider["model"]}, limit)
         written[idx] = {"text": new_text, "ratio": new_ratio}
         wrote = True
     return True
@@ -584,11 +586,14 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
     for i in isolated:
         log.warning("line dropped (no translatable text): uid=%s", utts[i].uid)
 
-    # T214 落库（version化）：只写真实译文，占位符/被滤句一律隔离不写
+    # T214 落库（version化）：只写真实译文，占位符/被滤句一律隔离不写。
+    # llm_model 标"主模型|R2本地化模型"（多Agent分步，QC可复盘实际执行者）
+    model_tag = provider["model"] + ("|" + r2_step_cfg["model"] if r2_step_cfg else "")
     written: dict[int, dict] = {}
     for i in sorted(valid):
         ratio = syllable_ratio(valid[i], _src_of(utts[i]), target)
-        _write_translation(db, utts[i], target, valid[i], ratio, ctx, provider, limit)
+        _write_translation(db, utts[i], target, valid[i], ratio, ctx,
+                           {**provider, "model": model_tag}, limit)
         written[i] = {"text": valid[i], "ratio": ratio}
     db.commit()
 
@@ -613,7 +618,8 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
             part = over[start:start + batch_size]
             for cand in comp_candidates:
                 ok = await _compress_chunk(db, cand, lang_rule, utts, part, written,
-                                           budget, target, limit, ctx)
+                                           budget, target, limit, ctx,
+                                           model_tag=model_tag + "|compress:" + cand["model"])
                 if ok:
                     break
         db.commit()
