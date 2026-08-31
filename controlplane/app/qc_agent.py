@@ -41,9 +41,11 @@ def qc_translate(task: PipelineTask, db: Session) -> dict:
                 "action": "review"}
     over = [t for t in translated if t.is_over_limit]
     empty = [t for t in translated if not (t.text or "").strip()]
+    untranslated = len(utts) - len(translated)
     checks = [
         _check("音节比≤1.15", len(over) == 0, f"{len(over)}句超限"),
         _check("空译=0", len(empty) == 0, f"{len(empty)}句空"),
+        _check("未翻译句=0", untranslated == 0, f"{untranslated}句未译(含隔离句)"),
     ]
     terms = db.query(GlossaryTerm).filter_by(
         target_lang=project.target_lang).all()

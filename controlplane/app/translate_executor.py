@@ -1,22 +1,26 @@
 """翻译执行器：五步链真实现（T205上下文包 → T211直译 → T212意译 → T213终检 → T214落库 → T220音节校验）
 
+v0.4（2026-08-31，白月光审核后重构）：
+- 子批执行：场景按 batch_size（默认10，project.config 可调）分块跑三步链
+- 内容审查韧性：网关以 HTTP 200 + finish_reason=content_filter + usage=0 + 拒绝文案
+  拒绝含敏感词的批（生产实测：行级触发，提示词措辞无法绕过）→ ContentFilteredError；
+  子批二分自动定位触发句并隔离（不落库），干净行照常翻译——绝不写 [MISSING] 占位符
+- R2 意译带每行音节预算（拉丁语目标）；R3 终检改增量协议（只回修改行，防截断）
+- 落库后超限压缩闭环（≤2轮，仍超限才计入 over_limit；待办#1）
 设计要点：
 - Provider 从 DB 读（translation_providers，is_default），key 经 crypto 解密，环境零硬编码
 - OpenAI 兼容 chat.completions；无 provider 时 fallback MOCK（本地词典，保证链路可测零成本）
-- 429 退避 30/60/90s（V3 §4.2），HTTP 超时90s；场景批 = 一次请求翻译整批行（编号协议解析）
-- 落库走 translations 表（utterance_id,target_lang,version 唯一），单句重翻=version+1
+- 429 退避 30/60/90s（V3 §4.2），HTTP 超时90s；落库走 translations 表
+  （utterance_id,target_lang,version 唯一），单句重翻=version+1
 - 音节估算按语种路由（V3 §1.2）：en/es/pt/id=元音组；ja=假名；ko=音节块；zh=字数
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
-from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .db.models import (GlossaryTerm, PipelineTask, Project, PromptTemplate,
@@ -27,6 +31,17 @@ log = logging.getLogger("translate_executor")
 
 BACKOFFS = (30, 60, 90, 30, 60)   # 429退避×5（PIPELINE-DETAILS Phase4）
 HTTP_TIMEOUT = 90.0
+
+# 内容审查拒绝文案特征（生产实测：'当前输入涉及敏感信息，让我们换个话题…'，usage=0）
+_REFUSAL_MARKERS = ("敏感", "换个话题", "cannot assist", "I cannot help", "无法协助")
+# 历史占位符签名（绝不允许再落库）
+_PLACEHOLDER_RE = re.compile(
+    r"^\s*\[(MISSING|Translation|UNTRANSLATED|Paragraph|Segment)")
+
+
+class ContentFilteredError(RuntimeError):
+    """网关内容审查拒绝。输入决定的结果——重试无意义，由上层二分隔离。"""
+
 
 # ── 音节估算（V3 §1.2 语种路由）─────────────────────────────
 _VOWEL_GROUPS = re.compile(r"[aeiouyàáèéìíòóùúãẽĩõũ]+", re.I)
@@ -52,6 +67,16 @@ def count_syllables(text: str, lang: str) -> int:
 def syllable_ratio(en_text: str, zh_text: str, lang: str) -> float:
     base = count_syllables(zh_text, "zh") or 1
     return round(count_syllables(en_text, lang) / base, 3)
+
+
+def _src_of(u: Utterance) -> str:
+    return u.merged_text or u.original_text or ""
+
+
+def _zh_ratio(s: str) -> float:
+    if not s:
+        return 0.0
+    return len(re.findall(r"[\u4e00-\u9fff]", s)) / max(len(s), 1)
 
 
 # ── LLM 客户端 ──────────────────────────────────────────────
@@ -80,8 +105,17 @@ def _key_of(cfg: dict) -> str:
     return ""
 
 
+def _is_refusal_text(content: str) -> bool:
+    """拒绝文案识别：短、无行协议、含特征词。正常翻译输出（带行协议）永不误判。"""
+    if not content:
+        return False
+    if re.search(r"^\s*\d+\s*[|｜]", content, re.M):
+        return False                      # 行协议输出=正常翻译结果
+    return len(content) < 120 and any(m in content for m in _REFUSAL_MARKERS)
+
+
 async def chat(cfg: dict, system: str, user: str) -> str:
-    """单次LLM调用（含429退避）。MOCK模式返回确定性占位译文。"""
+    """单次LLM调用（含429退避）。内容审查拒绝→ContentFilteredError（不退避重试）。"""
     if cfg["mode"] == "mock":
         return _mock_translate(user)
     key = _key_of(cfg)
@@ -104,7 +138,20 @@ async def chat(cfg: dict, system: str, user: str) -> str:
                 continue
             r.raise_for_status()
             data = r.json()
-            return (data["choices"][0]["message"].get("content") or "").strip()
+            ch = (data.get("choices") or [{}])[0]
+            msg = ch.get("message") or {}
+            content = (msg.get("content") or "").strip()
+            usage = data.get("usage") or {}
+            ctoks = usage.get("completion_tokens")
+            filtered = (ch.get("finish_reason") == "content_filter"
+                        or (not content and ctoks in (0, None))
+                        or _is_refusal_text(content))
+            if filtered:
+                # 输入决定的结果：重试同样被拒。抛给上层做二分隔离。
+                raise ContentFilteredError(
+                    f"gateway content filter: finish_reason={ch.get('finish_reason')} "
+                    f"completion_tokens={ctoks}")
+            return content
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 last_err = "HTTP 429"
@@ -134,13 +181,24 @@ def _mock_translate(user: str) -> str:
 
 
 def _parse_numbered(model_out: str, expect: int) -> dict[int, str]:
-    """解析 'N | 译文' 行协议；缺失行回退占位，绝不静默错位。"""
+    """解析 'N | 译文' 行协议；缺失行回退占位（仅在链内中间态使用，
+    落库前会被 _PLACEHOLDER_RE 拦截转隔离，绝不写入 DB）。"""
     got: dict[int, str] = {}
     for line in model_out.splitlines():
         m = re.match(r"^\s*(\d+)\s*[|｜]\s*(.+)$", line.strip())
         if m:
             got[int(m.group(1))] = m.group(2).strip()
     return {i: got.get(i, f"[MISSING {i}]") for i in range(1, expect + 1)}
+
+
+def _parse_fixes(model_out: str) -> dict[int, str]:
+    """解析增量输出（终检/压缩）：只返回模型实际给出的行。"""
+    got: dict[int, str] = {}
+    for line in model_out.splitlines():
+        m = re.match(r"^\s*(\d+)\s*[|｜]\s*(.+)$", line.strip())
+        if m:
+            got[int(m.group(1))] = m.group(2).strip()
+    return got
 
 
 # ── 上下文包（T205）────────────────────────────────────────
@@ -176,12 +234,140 @@ _R1_SYS = ("你是影视字幕直译员。逐行翻译编号台词，保持行�
            "直译即可，忠实原文，术语表里的词必须用指定译法。")
 _R2_SYS = ("你是影视配音译者。基于第一轮直译做意译：口语自然、符合角色人设、"
            "符合配音时长约束（尽量精炼）。保持行号格式 'N | 译文'。术语表译法不可更改。")
-_RV_SYS = ("你是译配终审。检查全部台词：角色名/术语前后一致、风格统一、无漏译。"
-           "输出修正后的完整清单，保持行号格式 'N | 译文'。无问题的行原样保留。")
+_RV_SYS = ("你是译配终审。检查台词清单：角色名/术语前后一致、风格统一、无漏译。"
+           "只输出需要修改的行，格式 'N | 修正译文'；无修改的行不要输出。"
+           "术语表译法不可更改。")
+_COMP_SYS = ("你是配音字幕压缩员。把每行译文压缩到目标音节数内：保持原意、人名与语气，"
+             "能删则删。保持行号格式 'N | 译文'。术语表译法不可更改。")
+
+_LATIN_TARGETS = ("en", "es", "pt", "id", "th", "vi", "ms", "fr", "de", "it")
+
+
+def _budget_map(utts: list[Utterance], target_lang: str,
+                limit: float) -> dict[int, int] | None:
+    """拉丁语目标给出每句音节预算（zh/ja/ko节奏不同，不给）。key=utterance下标。"""
+    if not any(target_lang.startswith(p) for p in _LATIN_TARGETS):
+        return None
+    return {i: max(1, int(count_syllables(_src_of(u), "zh") * limit))
+            for i, u in enumerate(utts)}
+
+
+def _budget_block(chunk: list[int], budget: dict[int, int] | None) -> str:
+    if not budget:
+        return ""
+    return ("时长预算(每行音节上限): "
+            + ", ".join(f"{i}→{budget[idx]}" for i, idx in enumerate(chunk, 1)) + "\n")
+
+
+async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
+                           utts: list[Utterance], chunk: list[int],
+                           gloss: str, cards: str,
+                           budget: dict[int, int] | None,
+                           prev_tail: list[str]) -> tuple[dict[int, str], list[str]]:
+    """一个块的 R1直译→R2意译→R3增量终检。返回 {utterance下标: 文本} 与尾部译文。"""
+    lines = [f"{i+1} | {_src_of(utts[idx])}" for i, idx in enumerate(chunk)]
+    r1 = await chat(provider, f"{_R1_SYS}\n{lang_rule}",
+                    f"术语表:\n{gloss}\n台词:\n" + "\n".join(lines))
+    t1 = _parse_numbered(r1, len(chunk))
+
+    prev3 = "\n".join(prev_tail[-3:]) if prev_tail else "（无）"
+    r2 = await chat(provider, f"{_R2_SYS}\n{lang_rule}",
+                    f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
+                    + _budget_block(chunk, budget)
+                    + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk))))
+    t2 = _parse_numbered(r2, len(chunk))
+
+    try:
+        rv = await chat(provider, f"{_RV_SYS}\n{lang_rule}",
+                        "全部台词(R2译):\n"
+                        + "\n".join(f"{i+1} | {t2[i+1]}" for i in range(len(chunk))))
+        fixes = _parse_fixes(rv)
+    except ContentFilteredError:
+        fixes = {}               # 终检被滤→降级用R2结果（R2已成功，不算失败）
+
+    texts = {}
+    for i, idx in enumerate(chunk):
+        fx = fixes.get(i + 1)
+        texts[idx] = fx if (fx and not _PLACEHOLDER_RE.match(fx)) else t2[i + 1]
+    tail = [texts[idx] for idx in chunk[-3:]]
+    return texts, tail
+
+
+async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
+                              utts: list[Utterance], chunk: list[int],
+                              gloss: str, cards: str,
+                              budget: dict[int, int] | None,
+                              prev_tail: list[str],
+                              stats: dict) -> tuple[dict[int, str], list[str]]:
+    """带审查韧性的块执行：ContentFilteredError→二分降批；单句仍被滤→隔离（返回空）。
+    stats["filtered_chunks"] 累计触发审查的块数。"""
+    try:
+        return await _run_chunk_chain(provider, ctx, lang_rule, utts, chunk,
+                                      gloss, cards, budget, prev_tail)
+    except ContentFilteredError:
+        stats["filtered_chunks"] += 1
+        if len(chunk) == 1:
+            log.warning("content-filter: 单句隔离 uid=%s", utts[chunk[0]].uid)
+            return {}, []
+        mid = len(chunk) // 2
+        texts: dict[int, str] = {}
+        tail = prev_tail
+        for half in (chunk[:mid], chunk[mid:]):
+            t2, tail2 = await _run_chunk_filtered(
+                provider, ctx, lang_rule, utts, half, gloss, cards,
+                budget, tail, stats)
+            texts.update(t2)
+            if tail2:
+                tail = tail2
+        return texts, tail
+
+
+def _write_translation(db: Session, u: Utterance, target_lang: str, text: str,
+                       ratio: float, ctx: dict, provider: dict, limit: float) -> None:
+    last = (db.query(Translation)
+              .filter_by(utterance_id=u.id, target_lang=target_lang)
+              .order_by(Translation.version.desc()).first())
+    ver = (last.version + 1) if last else 1
+    db.add(Translation(
+        utterance_id=u.id, target_lang=target_lang, version=ver, text=text,
+        syllable_count=count_syllables(text, target_lang),
+        syllable_ratio=ratio, is_over_limit=ratio > limit,
+        llm_model=provider["model"] if provider["mode"] == "live" else "mock-1",
+        prompt_version=ctx["prompt_version"],
+        is_approved=provider["mode"] == "mock"))
+
+
+async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
+                          utts: list[Utterance], part: list[int],
+                          written: dict[int, dict], budget: dict[int, int] | None,
+                          target: str, limit: float, ctx: dict) -> None:
+    """一轮压缩：把超限行压缩到预算内，写新版本（没变短不写）。"""
+    lines, pairs = [], []
+    for i, idx in enumerate(part, 1):
+        lines.append(f"{i} | {written[idx]['text']}")
+        if budget:
+            pairs.append(f"{i}→{budget[idx]}")
+    head = ("时长预算(每行音节上限): " + ", ".join(pairs) + "\n") if pairs else ""
+    try:
+        out = await chat(provider, f"{_COMP_SYS}\n{lang_rule}",
+                         head + "台词:\n" + "\n".join(lines))
+    except ContentFilteredError:
+        return                                   # 压缩批被滤→跳过本轮（不失败）
+    got = _parse_fixes(out)
+    for i, idx in enumerate(part, 1):
+        new_text = (got.get(i) or "").strip()
+        if not new_text or _PLACEHOLDER_RE.match(new_text):
+            continue
+        new_ratio = syllable_ratio(new_text, _src_of(utts[idx]), target)
+        if new_ratio >= written[idx]["ratio"]:
+            continue                             # 没变短，不值得+1版本
+        _write_translation(db, utts[idx], target, new_text, new_ratio, ctx, provider, limit)
+        written[idx] = {"text": new_text, "ratio": new_ratio}
 
 
 async def run_translate_scene(db: Session, project: Project, scene_key: str) -> dict:
-    """一个场景批的完整五步链。scene_key 形如 'SC01'（utterance.uid 前缀分组）。"""
+    """一个场景批的完整五步链（v0.4：子批+审查二分隔离+音节预算+压缩闭环）。
+    scene_key 形如 'SC01'（utterance.uid 前缀分组）。"""
     utts = (db.query(Utterance).filter_by(project_id=project.id)
               .order_by(Utterance.seq_index).all())
     in_scene = [u for u in utts if (u.uid or "").startswith(f"{scene_key}-")]
@@ -192,62 +378,66 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
 
     ctx = build_ctx_pack(db, project, utts)
     provider = load_default_provider(db)
-    lines = [f"{i+1} | {u.merged_text or u.original_text}" for i, u in enumerate(utts)]
+    target = ctx["target_lang"]
+    target_is_zh = target.startswith("zh")
+    limit = (project.config or {}).get("syllable_limit", 1.15)
+    batch_size = max(1, int((project.config or {}).get("batch_size", 10)))
     gloss = "\n".join(f"- {k} → {v}" for k, v in ctx["glossary"].items()) or "（无）"
     cards = "；".join(c["role_name"] for c in ctx["role_cards"]) or "（未标注）"
+    lang_rule = _lang_rule(target)
+    budget = _budget_map(utts, target, limit)
 
-    lang_rule = _lang_rule(ctx["target_lang"])
-    r1 = await chat(provider, f"{_R1_SYS}\n{lang_rule}",
-                    f"术语表:\n{gloss}\n台词:\n" + "\n".join(lines))
-    t1 = _parse_numbered(r1, len(utts))
+    n = len(utts)
+    stats = {"filtered_chunks": 0}
+    finals: dict[int, str] = {}
+    tail: list[str] = []
+    for start in range(0, n, batch_size):
+        chunk = list(range(start, min(start + batch_size, n)))
+        texts, new_tail = await _run_chunk_filtered(
+            provider, ctx, lang_rule, utts, chunk, gloss, cards, budget, tail, stats)
+        finals.update(texts)
+        if new_tail:
+            tail = new_tail
 
-    prev3 = "\n".join(l.split("|", 1)[-1].strip() for l in r1.splitlines()[-3:])
-    r2 = await chat(provider, f"{_R2_SYS}\n{lang_rule}",
-                    f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
-                    f"第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(utts))))
-    t2 = _parse_numbered(r2, len(utts))
-
-    rv = await chat(provider, f"{_RV_SYS}\n{lang_rule}",
-                    "全部台词终检:\n" + "\n".join(f"{i+1} | {t2[i+1]}" for i in range(len(utts))))
-    t3 = _parse_numbered(rv, len(utts))
-
-    # 语种校验兜底：目标语非中文时，译文含中文比例>30%=翻译失败，整体重试一次
-    import re as _re
-    target_is_zh = ctx["target_lang"].startswith("zh")
-    def _zh_ratio(s: str) -> float:
-        if not s: return 0.0
-        return len(_re.findall(r"[\u4e00-\u9fff]", s)) / max(len(s), 1)
-    if not target_is_zh:
-        zh_bad = sum(1 for i in range(len(utts)) if _zh_ratio(t3[i+1]) > 0.3)
-        if zh_bad > len(utts) * 0.3:
+    # 语种校验兜底（场景级，保持原阈值语义）：非中文目标时单句中文比例>30%记坏
+    valid = {i: t for i, t in finals.items() if t and not _PLACEHOLDER_RE.match(t)}
+    if not target_is_zh and valid:
+        zh_bad = sum(1 for t in valid.values() if _zh_ratio(t) > 0.3)
+        if zh_bad > n * 0.3:
             raise RuntimeError(
-                f"译文语种校验失败：{zh_bad}/{len(utts)}句含中文，LLM未遵守目标语种约束")
+                f"译文语种校验失败：{zh_bad}/{n}句含中文，LLM未遵守目标语种约束")
 
-    # T214 落库（version化：已有译文则version+1）
-    written = 0
-    for i, u in enumerate(utts):
-        text = t3[i + 1]
-        ratio = syllable_ratio(text, u.merged_text or u.original_text, ctx["target_lang"])
-        limit = (project.config or {}).get("syllable_limit", 1.15)
-        last = (db.query(Translation)
-                  .filter_by(utterance_id=u.id, target_lang=ctx["target_lang"])
-                  .order_by(Translation.version.desc()).first())
-        ver = (last.version + 1) if last else 1
-        db.add(Translation(
-            utterance_id=u.id, target_lang=ctx["target_lang"], version=ver, text=text,
-            syllable_count=count_syllables(text, ctx["target_lang"]),
-            syllable_ratio=ratio, is_over_limit=ratio > limit,
-            llm_model=provider["model"] if provider["mode"] == "live" else "mock-1",
-            prompt_version=ctx["prompt_version"],
-            is_approved=provider["mode"] == "mock"))
-        written += 1
+    isolated = sorted(set(range(n)) - set(valid))
+
+    # T214 落库（version化）：只写真实译文，占位符/被滤句一律隔离不写
+    written: dict[int, dict] = {}
+    for i in sorted(valid):
+        ratio = syllable_ratio(valid[i], _src_of(utts[i]), target)
+        _write_translation(db, utts[i], target, valid[i], ratio, ctx, provider, limit)
+        written[i] = {"text": valid[i], "ratio": ratio}
     db.commit()
-    return {"scene": scene_key, "utterances": written, "provider": provider["name"],
-            "mode": provider["mode"], "prompt_version": ctx["prompt_version"],
-            "over_limit": sum(1 for i in range(len(utts))
-                              if syllable_ratio(t3[i+1], utts[i].merged_text or
-                                                utts[i].original_text,
-                                                ctx["target_lang"]) > 1.15)}
+
+    # T220 附加：超限压缩闭环（≤2轮；mock不超限自然空转；被滤块跳过不失败）
+    rounds = 0
+    for _ in range(2):
+        over = [i for i in sorted(written) if written[i]["ratio"] > limit]
+        if not over:
+            break
+        rounds += 1
+        for start in range(0, len(over), batch_size):
+            part = over[start:start + batch_size]
+            await _compress_chunk(db, provider, lang_rule, utts, part, written,
+                                  budget, target, limit, ctx)
+        db.commit()
+
+    return {"scene": scene_key, "utterances": len(written),
+            "provider": provider["name"], "mode": provider["mode"],
+            "prompt_version": ctx["prompt_version"],
+            "over_limit": sum(1 for d in written.values() if d["ratio"] > limit),
+            "isolated": [{"uid": utts[i].uid, "seq_index": utts[i].seq_index}
+                         for i in isolated],
+            "filtered_chunks": stats["filtered_chunks"],
+            "compression_rounds": rounds}
 
 
 async def execute_translate_task(db: Session, task: PipelineTask) -> dict:

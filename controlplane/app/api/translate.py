@@ -193,13 +193,19 @@ async def run_translate(pid: str, simulate_upstream: bool = False,
                     info = await run_translate_scene(db, p, sc)
                     for t in ts:
                         t.status = "completed"
+                        # JSON列大坑：必须整体新dict赋值，不能同引用原地改
                         t.output_paths = {"scene": sc, "utterances": info["utterances"],
-                                          "mode": info["mode"]}
+                                          "mode": info["mode"],
+                                          "isolated": info.get("isolated", []),
+                                          "filtered_chunks": info.get("filtered_chunks", 0)}
                     db.commit()
                     from ..qc_agent import run_qc_hook
                     run_qc_hook(t0, db)   # QC Agent：场景批代表行跑质检钩子
                     entry.update({"status": "completed", "utterances": info["utterances"],
-                                  "mode": info["mode"]})
+                                  "mode": info["mode"],
+                                  "isolated": info.get("isolated", []),
+                                  "filtered_chunks": info.get("filtered_chunks", 0),
+                                  "compression_rounds": info.get("compression_rounds", 0)})
                     done_scenes.add(sc)
                 except Exception as e:                     # noqa: BLE001
                     msg = str(e)[:500]
@@ -229,7 +235,9 @@ async def run_translate(pid: str, simulate_upstream: bool = False,
                     db.add(shadow)
                 shadow.status = "completed"
                 shadow.output_paths = {"scene": sc, "utterances": info["utterances"],
-                                       "mode": info["mode"]}
+                                       "mode": info["mode"],
+                                       "isolated": info.get("isolated", []),
+                                       "filtered_chunks": info.get("filtered_chunks", 0)}
                 db.commit()
                 qc = run_qc_hook(shadow, db)
                 results.append({"task": f"{sc}/translate", "status": "completed",
