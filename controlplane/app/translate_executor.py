@@ -342,8 +342,11 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
                            utts: list[Utterance], chunk: list[int],
                            gloss: str, cards: str,
                            budget: dict[int, int] | None,
-                           prev_tail: list[str]) -> tuple[dict[int, str], list[str]]:
-    """一个块的 R1直译→R2意译→R3增量终检。返回 {utterance下标: 文本} 与尾部译文。"""
+                           prev_tail: list[str],
+                           r2_cfg: dict | None = None) -> tuple[dict[int, str], list[str]]:
+    """一个块的多Agent协作链（v1.0）：
+    R1直译=主力M3(最快) → R2本地化意译=专职模型(r2_cfg,默认DeepSeek-V3,习语地道化最强)
+    → R3增量终检=M3。返回 {utterance下标: 文本} 与尾部译文。"""
     lines = [f"{i+1} | {_src_of(utts[idx])}" for i, idx in enumerate(chunk)]
 
     def _merge(best: dict[int, str], alt: dict[int, str]) -> int:
@@ -373,7 +376,8 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
         raise FormatDriftError(f"R1 incomplete after retry: chunk={utts[chunk[0]].uid}")
 
     prev3 = "\n".join(prev_tail[-3:]) if prev_tail else "（无）"
-    r2 = await chat(provider, f"{_R2_SYS}\n{lang_rule}",
+    r2cfg = r2_cfg or provider
+    r2 = await chat(r2cfg, f"{_R2_SYS}\n{lang_rule}",
                     f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
                     + _budget_block(chunk, budget)
                     + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk))))
@@ -382,7 +386,7 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
         log.warning("R2 parse incomplete (%d/%d) chunk=%s — retry once",
                     sum(1 for v in t2.values() if _is_ph(v)), len(chunk),
                     utts[chunk[0]].uid)
-        t2b = _parse_numbered(await chat(provider, f"{_R2_SYS}\n{lang_rule}\n"
+        t2b = _parse_numbered(await chat(r2cfg, f"{_R2_SYS}\n{lang_rule}\n"
                                          "注意：只输出 'N | 译文' 格式的行，"
                                          "不要任何解释、前言或多余文本。",
                                          f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
@@ -419,7 +423,8 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
                               budget: dict[int, int] | None,
                               prev_tail: list[str],
                               stats: dict,
-                              fallback_chain: list[dict] | None = None
+                              fallback_chain: list[dict] | None = None,
+                              r2_step_cfg: dict | None = None
                               ) -> tuple[dict[int, str], list[str]]:
     """块执行+段级兜底链（v0.9）：任一失败（审查/网络/格式漂移）→
     当场换下一个模型重跑同一块，绝不重跑整个场景。
@@ -429,9 +434,12 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
                                if fb.get("model") != provider.get("model")]
     last_exc: Exception | None = None
     for ci, cand in enumerate(candidates):
+        # 分步模型路由：首轮 R2=专职本地化模型；兜底轮=兜底模型整块接管（含R2）
+        r2cfg = r2_step_cfg if ci == 0 else None
         try:
             texts, tail = await _run_chunk_chain(cand, ctx, lang_rule, utts, chunk,
-                                                 gloss, cards, budget, prev_tail)
+                                                 gloss, cards, budget, prev_tail,
+                                                 r2_cfg=r2cfg)
             if ci > 0:
                 stats["fallback_used"] += 1
                 log.warning("chunk=%s 主provider失败(%s) → 兜底#%d(%s)救援成功",
@@ -456,7 +464,7 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
             for half in (chunk[:mid], chunk[mid:]):
                 t2, tail2 = await _run_chunk_filtered(
                     provider, ctx, lang_rule, utts, half, gloss, cards,
-                    budget, tail, stats, fallback_chain)
+                    budget, tail, stats, fallback_chain, r2_step_cfg)
                 texts.update(t2)
                 if tail2:
                     tail = tail2
@@ -492,8 +500,9 @@ def _write_translation(db: Session, u: Utterance, target_lang: str, text: str,
 async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
                           utts: list[Utterance], part: list[int],
                           written: dict[int, dict], budget: dict[int, int] | None,
-                          target: str, limit: float, ctx: dict) -> None:
-    """一轮压缩：把超限行压缩到预算内，写新版本（没变短不写）。"""
+                          target: str, limit: float, ctx: dict) -> bool:
+    """一轮压缩：把超限行压缩到预算内，写新版本（没变短不写）。
+    返回 False=被内容审查拒绝（上层换下一兜底模型重试）。"""
     lines, pairs = [], []
     for i, idx in enumerate(part, 1):
         lines.append(f"{i} | {written[idx]['text']}")
@@ -504,8 +513,9 @@ async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
         out = await chat(provider, f"{_COMP_SYS}\n{lang_rule}",
                          head + "台词:\n" + "\n".join(lines))
     except ContentFilteredError:
-        return                                   # 压缩批被滤→跳过本轮（不失败）
+        return False
     got = _parse_fixes(out)
+    wrote = False
     for i, idx in enumerate(part, 1):
         new_text = (got.get(i) or "").strip()
         if not new_text or _PLACEHOLDER_RE.match(new_text):
@@ -515,6 +525,8 @@ async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
             continue                             # 没变短，不值得+1版本
         _write_translation(db, utts[idx], target, new_text, new_ratio, ctx, provider, limit)
         written[idx] = {"text": new_text, "ratio": new_ratio}
+        wrote = True
+    return True
 
 
 async def run_translate_scene(db: Session, project: Project, scene_key: str) -> dict:
@@ -543,6 +555,11 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
     fallback_chain = load_fallback_providers(db)
     if fallback_chain:
         log.info("fallback chain: %s", [f["model"] for f in fallback_chain])
+    # R2 本地化专职模型：链里第一个 DeepSeek（实测习语地道化最强；每场景仅1次调用，9s可接受）
+    r2_step_cfg = next((f for f in fallback_chain
+                        if "deepseek" in (f.get("model") or "").lower()), None)
+    if r2_step_cfg:
+        log.info("R2 localizer agent: %s", r2_step_cfg["model"])
     stats = {"filtered_chunks": 0, "fallback_used": 0}
     finals: dict[int, str] = {}
     tail: list[str] = []
@@ -550,7 +567,7 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
         chunk = list(range(start, min(start + batch_size, n)))
         texts, new_tail = await _run_chunk_filtered(
             provider, ctx, lang_rule, utts, chunk, gloss, cards, budget, tail,
-            stats, fallback_chain)
+            stats, fallback_chain, r2_step_cfg)
         finals.update(texts)
         if new_tail:
             tail = new_tail
@@ -575,7 +592,17 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
         written[i] = {"text": valid[i], "ratio": ratio}
     db.commit()
 
-    # T220 附加：超限压缩闭环（≤2轮；mock不超限自然空转；被滤块跳过不失败）
+    # T220 附加：超限压缩闭环（≤2轮）。
+    # 压缩专职模型=Qwen3-235B（实测最精炼 avgR=1.05）；被滤/失败→按兜底链换模型重试同块
+    _comp_seen: list[str] = []
+    comp_candidates = []
+    for c in ([next((f for f in fallback_chain
+                     if "qwen" in (f.get("model") or "").lower()), provider)]
+              + fallback_chain):
+        mkey = c.get("model") or ""
+        if mkey not in _comp_seen:
+            _comp_seen.append(mkey)
+            comp_candidates.append(c)
     rounds = 0
     for _ in range(2):
         over = [i for i in sorted(written) if written[i]["ratio"] > limit]
@@ -584,8 +611,11 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
         rounds += 1
         for start in range(0, len(over), batch_size):
             part = over[start:start + batch_size]
-            await _compress_chunk(db, provider, lang_rule, utts, part, written,
-                                  budget, target, limit, ctx)
+            for cand in comp_candidates:
+                ok = await _compress_chunk(db, cand, lang_rule, utts, part, written,
+                                           budget, target, limit, ctx)
+                if ok:
+                    break
         db.commit()
 
     return {"scene": scene_key, "utterances": len(written),
