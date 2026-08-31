@@ -105,6 +105,21 @@ def load_default_provider(db: Session) -> dict:
             "_enc": p.api_key_encrypted or ""}
 
 
+def load_fallback_provider(db: Session) -> dict | None:
+    """保底provider（v0.5）：启用中、非默认、优先级最高的第一个。
+    主provider被网关内容审查拒绝的单句，自动切保底重试。无→None。"""
+    p = (db.query(TranslationProvider)
+           .filter_by(is_enabled=True, is_default=False)
+           .order_by(TranslationProvider.priority.desc())
+           .first())
+    if not p:
+        return None
+    return {"mode": "live", "name": p.name, "model": p.model_name or "",
+            "base": (p.api_base_url or "").rstrip("/"), "key": "",
+            "temperature": p.temperature or 0.7, "max_tokens": p.max_tokens or 4096,
+            "_enc": p.api_key_encrypted or ""}
+
+
 def _key_of(cfg: dict) -> str:
     if cfg.get("key"):
         return cfg["key"]
@@ -340,16 +355,31 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
                               gloss: str, cards: str,
                               budget: dict[int, int] | None,
                               prev_tail: list[str],
-                              stats: dict) -> tuple[dict[int, str], list[str]]:
-    """带审查韧性的块执行：ContentFilteredError→二分降批；单句仍被滤→隔离（返回空）。
-    stats["filtered_chunks"] 累计触发审查的块数。"""
+                              stats: dict,
+                              fallback: dict | None = None
+                              ) -> tuple[dict[int, str], list[str]]:
+    """带审查韧性的块执行：ContentFilteredError→二分降批；单句仍被滤→
+    切保底provider重试；保底也被滤→隔离（返回空）。
+    stats: filtered_chunks=触发审查块数, fallback_used=保底救援成功句数。"""
     try:
         return await _run_chunk_chain(provider, ctx, lang_rule, utts, chunk,
                                       gloss, cards, budget, prev_tail)
     except ContentFilteredError:
         stats["filtered_chunks"] += 1
         if len(chunk) == 1:
-            log.warning("content-filter: 单句隔离 uid=%s", utts[chunk[0]].uid)
+            if fallback is not None:
+                try:
+                    texts, tail = await _run_chunk_chain(
+                        fallback, ctx, lang_rule, utts, chunk,
+                        gloss, cards, budget, prev_tail)
+                    stats["fallback_used"] += 1
+                    log.warning("content-filter: 主provider拒句 uid=%s → 保底(%s)救援成功",
+                                utts[chunk[0]].uid, fallback["model"])
+                    return texts, tail
+                except ContentFilteredError:
+                    log.warning("content-filter: 保底也被拒 uid=%s → 隔离", utts[chunk[0]].uid)
+            else:
+                log.warning("content-filter: 单句隔离(无保底) uid=%s", utts[chunk[0]].uid)
             return {}, []
         mid = len(chunk) // 2
         texts: dict[int, str] = {}
@@ -357,7 +387,7 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
         for half in (chunk[:mid], chunk[mid:]):
             t2, tail2 = await _run_chunk_filtered(
                 provider, ctx, lang_rule, utts, half, gloss, cards,
-                budget, tail, stats)
+                budget, tail, stats, fallback)
             texts.update(t2)
             if tail2:
                 tail = tail2
@@ -430,13 +460,17 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
     budget = _budget_map(utts, target, limit)
 
     n = len(utts)
-    stats = {"filtered_chunks": 0}
+    fallback = load_fallback_provider(db)
+    if fallback:
+        log.info("fallback provider: %s (%s)", fallback["name"], fallback["model"])
+    stats = {"filtered_chunks": 0, "fallback_used": 0}
     finals: dict[int, str] = {}
     tail: list[str] = []
     for start in range(0, n, batch_size):
         chunk = list(range(start, min(start + batch_size, n)))
         texts, new_tail = await _run_chunk_filtered(
-            provider, ctx, lang_rule, utts, chunk, gloss, cards, budget, tail, stats)
+            provider, ctx, lang_rule, utts, chunk, gloss, cards, budget, tail,
+            stats, fallback)
         finals.update(texts)
         if new_tail:
             tail = new_tail
@@ -481,6 +515,7 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
             "isolated": [{"uid": utts[i].uid, "seq_index": utts[i].seq_index}
                          for i in isolated],
             "filtered_chunks": stats["filtered_chunks"],
+            "fallback_used": stats["fallback_used"],
             "compression_rounds": rounds}
 
 

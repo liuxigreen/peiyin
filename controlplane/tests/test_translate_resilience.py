@@ -120,3 +120,39 @@ def test_compression_rounds_bounded(tmp_path):
     utts = c.get(f"/api/projects/{pid}/utterances?lang=en").json()
     # mock 译文极短，不应有超限残留
     assert not any(u["over_limit"] for u in utts if u["translated"]), utts
+
+
+def test_fallback_provider_rescue(tmp_path, monkeypatch):
+    """主provider拒句→保底provider救援成功→该句落库而非隔离。"""
+    c = _client(str(tmp_path / "r4.db"))
+    pid = c.post("/api/projects", json={"name": "保底剧", "target_lang": "en"}).json()["id"]
+    c.post(f"/api/projects/{pid}/seed-srt", json={"srt": _SRT})
+
+    FALLBACK = {"mode": "live", "name": "fb", "model": "glm-fb", "base": "",
+                "key": "", "temperature": 0.7, "max_tokens": 2048}
+    monkeypatch.setattr(te, "load_fallback_provider", lambda db: FALLBACK)
+
+    async def _stub(cfg, system, user):
+        CALLS["n"] += 1
+        if cfg["model"] == "primary" and _TRIGGER in user:
+            raise te.ContentFilteredError("gateway content filter")
+        return te._mock_translate(user)
+
+    # 把主provider模型名固定为primary以便stub区分
+    real_load = te.load_default_provider
+    monkeypatch.setattr(te, "load_default_provider",
+                        lambda db: {**real_load(db), "model": "primary"})
+
+    te.chat = _stub
+    try:
+        r = c.post(f"/api/projects/{pid}/run-translate").json()
+    finally:
+        te.chat = te.chat  # noqa - 实际由fixture恢复，monkeypatch管理stub生命周期
+
+    sc = [x for x in r["results"] if x["task"].startswith("SC")][0]
+    assert sc["status"] == "completed", r
+    assert sc.get("fallback_used", 0) == 1, r
+    utts = c.get(f"/api/projects/{pid}/utterances?lang=en").json()
+    trig = [u for u in utts if u["original"] == _TRIGGER][0]
+    assert trig["translated"], trig          # 被保底救回，未隔离
+    assert not trig["translated"].startswith("[MISSING"), trig
