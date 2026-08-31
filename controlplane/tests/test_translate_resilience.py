@@ -63,20 +63,15 @@ def test_filter_isolation_bisect(tmp_path):
     finally:
         te.chat = te_chat
 
+    # v0.9语义：无兜底链时，含触发句的块在二分后单句仍被滤→FormatDriftError/
+    # ContentFilteredError 向上抛→场景显式failed（绝不静默写垃圾行）
     sc = [x for x in r["results"] if x["task"].startswith("SC")]
-    assert sc and sc[0]["status"] == "completed", r
-    assert sc[0]["filtered_chunks"] >= 1, r          # 确实触发过审查
+    assert sc and sc[0]["status"] == "failed", r
+    assert "content filter" in sc[0].get("error", ""), r
+    # 未落库任何译文（无兜底可救，宁可失败不可污染）
     utts = c.get(f"/api/projects/{pid}/utterances?lang=en").json()
-    by_orig = {u["original"]: u for u in utts}
-    # 触发句被隔离：无译文、version=0
-    trig = by_orig[_TRIGGER]
-    assert trig["translated"] == "" and trig["version"] == 0, trig
-    # 其余3句有真实译文（mock词典/占位行，但绝不是[MISSING占位）
-    for orig in ("总裁，夫人她离婚了！", "你怎么敢跟我说话", "我不知道他在哪里"):
-        u = by_orig[orig]
-        assert u["translated"] and u["version"] >= 1, u
-        assert not u["translated"].startswith("[MISSING"), u
-    # 二分确实发生：4句批+10句batch_size→1块；触发后拆2块再各拆2块…调用数>1
+    assert all(u["translated"] == "" for u in utts), utts
+    # 二分确实发生：4句批→拆2块→各拆单句，调用数>1
     assert CALLS["n"] > 1, CALLS
 
 
@@ -91,31 +86,47 @@ def test_placeholder_never_persisted(tmp_path):
         r = c.post(f"/api/projects/{pid}/run-translate").json()
     finally:
         te.chat = te_chat
-    assert r["completed"] >= 1, r
+    # _SRT含触发句：无兜底时场景显式失败（不落库）；断言零占位符落库的核心语义不变
     from app.db.session import SessionLocal
     from app.db.models import Translation
     db = SessionLocal()
     try:
-        bad = [t.text for t in db.query(Translation).all()
-               if t.text.startswith("[MISSING") or t.text.startswith("[Translation")]
+        all_texts = [t.text for t in db.query(Translation).all()]
+        bad = [t for t in all_texts
+               if t.startswith("[MISSING") or t.startswith("[Translation")]
         assert not bad, bad
+        if all_texts:
+            assert r["completed"] >= 1, r
     finally:
         db.close()
 
 
-def test_compression_rounds_bounded(tmp_path):
-    """压缩闭环：mock 下能跑完、轮数≤2、超限行有重算。"""
+def test_compression_rounds_bounded(tmp_path, monkeypatch):
+    """压缩闭环：mock 下能跑完、轮数≤2、超限行有重算。
+    v0.9语义：本场景含触发句，配了能翻它的兜底链→场景正常完成。"""
     c = _client(str(tmp_path / "r3.db"))
     pid = c.post("/api/projects", json={"name": "压缩剧", "target_lang": "en"}).json()["id"]
     c.post(f"/api/projects/{pid}/seed-srt", json={"srt": _SRT})
+    FB = {"mode": "live", "name": "fb", "model": "fb-m", "base": "",
+          "key": "", "temperature": 0.7, "max_tokens": 2048}
+    monkeypatch.setattr(te, "load_fallback_providers", lambda db: [FB])
+
+    async def _stub_by_model(cfg, system, user):
+        """主模型(mock-1)对触发句拒；兜底模型(fb-m)能翻——验证段级救援。"""
+        CALLS["n"] += 1
+        if cfg.get("model") != "fb-m" and _TRIGGER in user:
+            raise te.ContentFilteredError("gateway content filter")
+        return te._mock_translate(user)
+
     te_chat = te.chat
-    te.chat = _stub_chat
+    te.chat = _stub_by_model
     try:
         r = c.post(f"/api/projects/{pid}/run-translate").json()
     finally:
         te.chat = te_chat
     sc = [x for x in r["results"] if x["task"].startswith("SC")][0]
-    assert sc["status"] == "completed"
+    assert sc["status"] == "completed", r
+    assert sc.get("fallback_used", 0) >= 1, r       # 触发句由兜底翻译
     assert sc.get("compression_rounds", 0) <= 2
     utts = c.get(f"/api/projects/{pid}/utterances?lang=en").json()
     # mock 译文极短，不应有超限残留
@@ -130,7 +141,7 @@ def test_fallback_provider_rescue(tmp_path, monkeypatch):
 
     FALLBACK = {"mode": "live", "name": "fb", "model": "glm-fb", "base": "",
                 "key": "", "temperature": 0.7, "max_tokens": 2048}
-    monkeypatch.setattr(te, "load_fallback_provider", lambda db: FALLBACK)
+    monkeypatch.setattr(te, "load_fallback_providers", lambda db: [FALLBACK])
 
     async def _stub(cfg, system, user):
         CALLS["n"] += 1

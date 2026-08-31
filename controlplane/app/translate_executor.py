@@ -43,6 +43,10 @@ class ContentFilteredError(RuntimeError):
     """网关内容审查拒绝。输入决定的结果——重试无意义，由上层二分隔离。"""
 
 
+class FormatDriftError(RuntimeError):
+    """模型输出格式漂移（重试后行协议仍解析不全）。由兜底链换模型接手。"""
+
+
 class _RateLimiter:
     """全局调用节奏器：把每provider的调用间隔精确排开（用户实测M3限10次/分）。
     持锁等待=排队效果，所有并发worker共享同一节奏，从源头消灭429盲等。"""
@@ -65,15 +69,22 @@ class _RateLimiter:
 _LIMITERS: dict[str, _RateLimiter] = {}
 
 
-def _get_limiter(provider_name: str) -> _RateLimiter | None:
-    """MiniMax-M3 限 9 次/分（默认，env TRANSLATE_RATE_PER_MIN 可调）；其他provider不限。"""
-    if "minimax-m3" not in (provider_name or "").lower():
+def _get_limiter(cfg: dict) -> _RateLimiter | None:
+    """按 模型 的实测配额限速（env可调）：
+    MiniMax-M3=9/分（用户实测10/分留余量）；edgefn其他模型=4/分（burst实测更紧）；
+    chat-b-ai(b.ai)=不限（2000/分）；未知=不限。"""
+    import os
+    tag = f"{cfg.get('name', '')} {cfg.get('model', '')}".lower()
+    key = f"{cfg.get('name', '')}:{cfg.get('model', '')}"
+    if "minimax-m3" in tag:
+        rate = float(os.getenv("TRANSLATE_RATE_M3", "9"))
+    elif "edgefn" in tag and "minimax" not in tag:
+        rate = float(os.getenv("TRANSLATE_RATE_EDGEFN_ALT", "4"))
+    else:
         return None
-    if provider_name not in _LIMITERS:
-        import os
-        rate = float(os.getenv("TRANSLATE_RATE_PER_MIN", "9"))
-        _LIMITERS[provider_name] = _RateLimiter(rate)
-    return _LIMITERS[provider_name]
+    if key not in _LIMITERS:
+        _LIMITERS[key] = _RateLimiter(rate)
+    return _LIMITERS[key]
 
 
 # ── 音节估算（V3 §1.2 语种路由）─────────────────────────────
@@ -138,19 +149,23 @@ def load_default_provider(db: Session) -> dict:
             "_enc": p.api_key_encrypted or ""}
 
 
+def load_fallback_providers(db: Session) -> list[dict]:
+    """兜底provider链（v0.9）：启用中、非默认，按priority降序。
+    edgefn同网关多模型（新key全模型可用）+ 外部网关构成段级兜底链。"""
+    rows = (db.query(TranslationProvider)
+              .filter_by(is_enabled=True, is_default=False)
+              .order_by(TranslationProvider.priority.desc())
+              .all())
+    return [{"mode": "live", "name": p.name, "model": p.model_name or "",
+             "base": (p.api_base_url or "").rstrip("/"), "key": "",
+             "temperature": p.temperature or 0.7, "max_tokens": p.max_tokens or 4096,
+             "_enc": p.api_key_encrypted or ""} for p in rows]
+
+
 def load_fallback_provider(db: Session) -> dict | None:
-    """保底provider（v0.5）：启用中、非默认、优先级最高的第一个。
-    主provider被网关内容审查拒绝的单句，自动切保底重试。无→None。"""
-    p = (db.query(TranslationProvider)
-           .filter_by(is_enabled=True, is_default=False)
-           .order_by(TranslationProvider.priority.desc())
-           .first())
-    if not p:
-        return None
-    return {"mode": "live", "name": p.name, "model": p.model_name or "",
-            "base": (p.api_base_url or "").rstrip("/"), "key": "",
-            "temperature": p.temperature or 0.7, "max_tokens": p.max_tokens or 4096,
-            "_enc": p.api_key_encrypted or ""}
+    """兼容旧签名：兜底链第一个。"""
+    chain = load_fallback_providers(db)
+    return chain[0] if chain else None
 
 
 def _key_of(cfg: dict) -> str:
@@ -191,7 +206,7 @@ async def chat(cfg: dict, system: str, user: str) -> str:
             log.warning("429 backoff %ss (attempt %d)", wait, attempt)
             await asyncio.sleep(wait)
         try:
-            lim = _get_limiter(cfg["name"])
+            lim = _get_limiter(cfg)
             if lim:
                 await lim.acquire()
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
@@ -354,6 +369,8 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
                                          f"术语表:\n{gloss}\n台词:\n" + "\n".join(lines)),
                               len(chunk))
         _merge(t1, t1b)
+    if any(_is_ph(v) for v in t1.values()):
+        raise FormatDriftError(f"R1 incomplete after retry: chunk={utts[chunk[0]].uid}")
 
     prev3 = "\n".join(prev_tail[-3:]) if prev_tail else "（无）"
     r2 = await chat(provider, f"{_R2_SYS}\n{lang_rule}",
@@ -377,6 +394,8 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
     for k in t2:
         if _is_ph(t2[k]) and not _is_ph(t1[k]):
             t2[k] = t1[k]
+    if any(_is_ph(v) for v in t2.values()):
+        raise FormatDriftError(f"R2 incomplete after retry+R1 fallback: chunk={utts[chunk[0]].uid}")
 
     try:
         rv = await chat(provider, f"{_RV_SYS}\n{lang_rule}",
@@ -400,53 +419,59 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
                               budget: dict[int, int] | None,
                               prev_tail: list[str],
                               stats: dict,
-                              fallback: dict | None = None
+                              fallback_chain: list[dict] | None = None
                               ) -> tuple[dict[int, str], list[str]]:
-    """带审查韧性的块执行：ContentFilteredError→二分降批；单句仍被滤→
-    切保底provider重试；保底也被滤→隔离（返回空）。
-    stats: filtered_chunks=触发审查块数, fallback_used=保底救援成功句数。"""
-    try:
-        return await _run_chunk_chain(provider, ctx, lang_rule, utts, chunk,
-                                      gloss, cards, budget, prev_tail)
-    except (httpx.TimeoutException, httpx.TransportError) as e:
-        # 主provider网络故障（edgefn实测会ConnectTimeout）→整块切保底重试
-        if fallback is not None:
-            log.warning("主provider网络故障(%s) chunk=%s → 保底(%s)整块救援",
-                        type(e).__name__, utts[chunk[0]].uid, fallback["model"])
-            texts, tail = await _run_chunk_chain(
-                fallback, ctx, lang_rule, utts, chunk,
-                gloss, cards, budget, prev_tail)
-            stats["fallback_used"] += 1
+    """块执行+段级兜底链（v0.9）：任一失败（审查/网络/格式漂移）→
+    当场换下一个模型重跑同一块，绝不重跑整个场景。
+    主provider整块被滤→二分定位触发句（干净子块主provider跑）。"""
+    # 兜底模型链：主provider跑（审查/网络/漂移任一失败）→ 按序换模型跑同一块
+    candidates = [provider] + [fb for fb in (fallback_chain or [])
+                               if fb.get("model") != provider.get("model")]
+    last_exc: Exception | None = None
+    for ci, cand in enumerate(candidates):
+        try:
+            texts, tail = await _run_chunk_chain(cand, ctx, lang_rule, utts, chunk,
+                                                 gloss, cards, budget, prev_tail)
+            if ci > 0:
+                stats["fallback_used"] += 1
+                log.warning("chunk=%s 主provider失败(%s) → 兜底#%d(%s)救援成功",
+                            utts[chunk[0]].uid, type(last_exc).__name__ if last_exc else "?",
+                            ci, cand.get("model"))
             return texts, tail
-        raise
-    except ContentFilteredError:
-        stats["filtered_chunks"] += 1
-        if len(chunk) == 1:
-            if fallback is not None:
-                try:
-                    texts, tail = await _run_chunk_chain(
-                        fallback, ctx, lang_rule, utts, chunk,
-                        gloss, cards, budget, prev_tail)
-                    stats["fallback_used"] += 1
-                    log.warning("content-filter: 主provider拒句 uid=%s → 保底(%s)救援成功",
-                                utts[chunk[0]].uid, fallback["model"])
-                    return texts, tail
-                except ContentFilteredError:
-                    log.warning("content-filter: 保底也被拒 uid=%s → 隔离", utts[chunk[0]].uid)
-            else:
-                log.warning("content-filter: 单句隔离(无保底) uid=%s", utts[chunk[0]].uid)
-            return {}, []
-        mid = len(chunk) // 2
-        texts: dict[int, str] = {}
-        tail = prev_tail
-        for half in (chunk[:mid], chunk[mid:]):
-            t2, tail2 = await _run_chunk_filtered(
-                provider, ctx, lang_rule, utts, half, gloss, cards,
-                budget, tail, stats, fallback)
-            texts.update(t2)
-            if tail2:
-                tail = tail2
-        return texts, tail
+        except ContentFilteredError as e:
+            last_exc = e
+            stats["filtered_chunks"] += 1
+            if ci == 0 and len(chunk) == 1:
+                log.warning("content-filter: 主provider拒句 uid=%s → 换兜底模型",
+                            utts[chunk[0]].uid)
+                continue
+            if ci > 0 or len(chunk) == 1:
+                log.warning("content-filter: 兜底#%d也拒 chunk=%s(%d句)",
+                            ci, utts[chunk[0]].uid, len(chunk))
+                break
+            # 主provider整块被滤→二分定位（用主provider跑干净子块）
+            mid = len(chunk) // 2
+            texts: dict[int, str] = {}
+            tail = prev_tail
+            for half in (chunk[:mid], chunk[mid:]):
+                t2, tail2 = await _run_chunk_filtered(
+                    provider, ctx, lang_rule, utts, half, gloss, cards,
+                    budget, tail, stats, fallback_chain)
+                texts.update(t2)
+                if tail2:
+                    tail = tail2
+            return texts, tail
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_exc = e
+            log.warning("chunk=%s provider=%s 网络故障(%s) → 换下一兜底",
+                        utts[chunk[0]].uid, cand.get("model"), type(e).__name__)
+            continue
+        except FormatDriftError as e:
+            last_exc = e
+            log.warning("chunk=%s provider=%s 格式漂移 → 换下一兜底",
+                        utts[chunk[0]].uid, cand.get("model"))
+            continue
+    raise last_exc if last_exc else RuntimeError("all fallback candidates failed")
 
 
 def _write_translation(db: Session, u: Utterance, target_lang: str, text: str,
@@ -515,9 +540,9 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
     budget = _budget_map(utts, target, limit)
 
     n = len(utts)
-    fallback = load_fallback_provider(db)
-    if fallback:
-        log.info("fallback provider: %s (%s)", fallback["name"], fallback["model"])
+    fallback_chain = load_fallback_providers(db)
+    if fallback_chain:
+        log.info("fallback chain: %s", [f["model"] for f in fallback_chain])
     stats = {"filtered_chunks": 0, "fallback_used": 0}
     finals: dict[int, str] = {}
     tail: list[str] = []
@@ -525,7 +550,7 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
         chunk = list(range(start, min(start + batch_size, n)))
         texts, new_tail = await _run_chunk_filtered(
             provider, ctx, lang_rule, utts, chunk, gloss, cards, budget, tail,
-            stats, fallback)
+            stats, fallback_chain)
         finals.update(texts)
         if new_tail:
             tail = new_tail
