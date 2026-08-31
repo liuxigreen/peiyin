@@ -181,6 +181,10 @@ async def chat(cfg: dict, system: str, user: str) -> str:
                "max_tokens": cfg["max_tokens"],
                "messages": [{"role": "system", "content": system},
                             {"role": "user", "content": user}]}
+    # M3思考模式开关（白山网关实测：enable_thinking=false 思考归零、token-69%、延迟减半，
+    # 行协议完好）。字幕直译+术语表约束下思考增益有限，默认关闭换速度与成本。
+    if "minimax" in (cfg["model"] or "").lower():
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     last_err = ""
     for attempt, wait in enumerate((0,) + BACKOFFS):
         if wait:
