@@ -31,9 +31,12 @@ def qc_translate(task: PipelineTask, db: Session) -> dict:
         return {"pass": False, "checks": [_check("项目存在", False, task.project_id)],
                 "action": "review"}
     utts = db.query(Utterance).filter_by(project_id=task.project_id).all()
+    from .translate_executor import is_placeholder
     latest: dict[str, Translation] = {}
     for t in (db.query(Translation).filter_by(target_lang=project.target_lang)
                  .order_by(Translation.version).all()):
+        if is_placeholder(t.text or ""):
+            continue                     # 占位行视同不存在：隔离句=未翻译，QC拦住
         latest[t.utterance_id] = t
     translated = [latest[u.id] for u in utts if u.id in latest]
     if not translated:

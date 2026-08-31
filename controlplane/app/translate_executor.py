@@ -73,6 +73,15 @@ def _src_of(u: Utterance) -> str:
     return u.merged_text or u.original_text or ""
 
 
+def _is_ph(s: str) -> bool:
+    return bool(_PLACEHOLDER_RE.match(s or ""))
+
+
+def is_placeholder(text: str) -> bool:
+    """占位符/拒绝残留判定（历史bug落库的垃圾行；下游取数一律视同不存在）。"""
+    return _is_ph(text)
+
+
 def _zh_ratio(s: str) -> float:
     if not s:
         return 0.0
@@ -266,9 +275,28 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
                            prev_tail: list[str]) -> tuple[dict[int, str], list[str]]:
     """一个块的 R1直译→R2意译→R3增量终检。返回 {utterance下标: 文本} 与尾部译文。"""
     lines = [f"{i+1} | {_src_of(utts[idx])}" for i, idx in enumerate(chunk)]
+
+    def _merge(best: dict[int, str], alt: dict[int, str]) -> int:
+        """用 alt 补 best 里的缺失行，返回补上的行数。"""
+        fixed = 0
+        for k in best:
+            if _is_ph(best[k]) and not _is_ph(alt.get(k, "")):
+                best[k] = alt[k]
+                fixed += 1
+        return fixed
+
     r1 = await chat(provider, f"{_R1_SYS}\n{lang_rule}",
                     f"术语表:\n{gloss}\n台词:\n" + "\n".join(lines))
     t1 = _parse_numbered(r1, len(chunk))
+    if any(_is_ph(v) for v in t1.values()):
+        # M3偶发格式漂移（输出不带行协议）：重试一次，两份取并集
+        log.warning("R1 parse incomplete (%d/%d) chunk=%s — retry once",
+                    sum(1 for v in t1.values() if _is_ph(v)), len(chunk),
+                    utts[chunk[0]].uid)
+        t1b = _parse_numbered(await chat(provider, f"{_R1_SYS}\n{lang_rule}",
+                                         f"术语表:\n{gloss}\n台词:\n" + "\n".join(lines)),
+                              len(chunk))
+        _merge(t1, t1b)
 
     prev3 = "\n".join(prev_tail[-3:]) if prev_tail else "（无）"
     r2 = await chat(provider, f"{_R2_SYS}\n{lang_rule}",
@@ -276,6 +304,20 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
                     + _budget_block(chunk, budget)
                     + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk))))
     t2 = _parse_numbered(r2, len(chunk))
+    if any(_is_ph(v) for v in t2.values()):
+        log.warning("R2 parse incomplete (%d/%d) chunk=%s — retry once",
+                    sum(1 for v in t2.values() if _is_ph(v)), len(chunk),
+                    utts[chunk[0]].uid)
+        t2b = _parse_numbered(await chat(provider, f"{_R2_SYS}\n{lang_rule}",
+                                         f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
+                                         + _budget_block(chunk, budget)
+                                         + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk)))),
+                              len(chunk))
+        _merge(t2, t2b)
+    # R2仍缺的行回退用R1直译（有译文好过隔离；终检会再看一遍）
+    for k in t2:
+        if _is_ph(t2[k]) and not _is_ph(t1[k]):
+            t2[k] = t1[k]
 
     try:
         rv = await chat(provider, f"{_RV_SYS}\n{lang_rule}",
@@ -408,6 +450,8 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
                 f"译文语种校验失败：{zh_bad}/{n}句含中文，LLM未遵守目标语种约束")
 
     isolated = sorted(set(range(n)) - set(valid))
+    for i in isolated:
+        log.warning("line dropped (no translatable text): uid=%s", utts[i].uid)
 
     # T214 落库（version化）：只写真实译文，占位符/被滤句一律隔离不写
     written: dict[int, dict] = {}

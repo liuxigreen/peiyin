@@ -52,9 +52,12 @@ def utterances(pid: str, lang: str = "en", db: Session = Depends(get_db)):
     utts = (db.query(m.Utterance).filter_by(project_id=pid)
               .order_by(m.Utterance.seq_index).limit(2000).all())
     # 每句取最新version译文（单句重翻version+1后Web显示新译文）
+    from ..translate_executor import is_placeholder
     latest: dict[str, m.Translation] = {}
     for t in (db.query(m.Translation).filter_by(target_lang=lang)
                  .order_by(m.Translation.version).all()):
+        if is_placeholder(t.text or ""):
+            continue                     # 历史bug占位行视同不存在（隔离句显示未翻译）
         latest[t.utterance_id] = t
     trs = latest
     spk_names = {s.id: (s.role_name or s.label) for s in

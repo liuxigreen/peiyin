@@ -86,9 +86,12 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
         info = await run_translate_scene(db, p, sc)
         tr_results.append(info)
     # 收集最新译文
+    from ..translate_executor import is_placeholder
     latest: dict[str, Translation] = {}
     for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
                  .order_by(Translation.version).all()):
+        if is_placeholder(t.text or ""):
+            continue                     # 隔离句不进交付包（音频位空缺→补传/人工）
         latest[t.utterance_id] = t
     translations = {u.uid: (latest[u.id].text if u.id in latest else "")
                     for u in utts}
