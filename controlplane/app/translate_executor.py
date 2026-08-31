@@ -364,6 +364,17 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
     try:
         return await _run_chunk_chain(provider, ctx, lang_rule, utts, chunk,
                                       gloss, cards, budget, prev_tail)
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        # 主provider网络故障（edgefn实测会ConnectTimeout）→整块切保底重试
+        if fallback is not None:
+            log.warning("主provider网络故障(%s) chunk=%s → 保底(%s)整块救援",
+                        type(e).__name__, utts[chunk[0]].uid, fallback["model"])
+            texts, tail = await _run_chunk_chain(
+                fallback, ctx, lang_rule, utts, chunk,
+                gloss, cards, budget, prev_tail)
+            stats["fallback_used"] += 1
+            return texts, tail
+        raise
     except ContentFilteredError:
         stats["filtered_chunks"] += 1
         if len(chunk) == 1:
