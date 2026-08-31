@@ -571,12 +571,16 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
 
 
 async def run_translate_project(project_id: str, scenes: list[str],
-                                workers: int = 4) -> list[dict]:
-    """场景级并行翻译（v0.6）：workers个并发、每个worker独立DB会话；
+                                workers: int | None = None) -> list[dict]:
+    """场景级并行翻译（v0.6.1）：workers个并发、每个worker独立DB会话；
     M3限速器全局共享（贴着9次/分跑满），429从源头消失。
+    workers默认取 TRANSLATE_WORKERS env（默认8）——配额按发出请求计，
+    思考时间服务端重叠，需 in-flight≈9/分×35s≈5.3 个并发才能吃满配额。
     返回逐场景结果；单场景失败不影响其他场景。"""
+    import os as _os
     import time as _time
     from .db.session import SessionLocal as _SL
+    workers = workers or max(1, int(_os.getenv("TRANSLATE_WORKERS", "8")))
     sem = asyncio.Semaphore(max(1, workers))
 
     async def _one(sc: str) -> dict:
