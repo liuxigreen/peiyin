@@ -78,18 +78,38 @@ def utterances(pid: str, lang: str = "en", db: Session = Depends(get_db)):
 
 @router.put("/{pid}/utterances/{uid}/translation")
 def save_translation(pid: str, uid: str, body: dict, db: Session = Depends(get_db)):
+    """单句热修：人工译文写新版本(version+1)保留历史（llm_model=human, is_approved），
+    同时把该句所属切片的 tts-generate 任务打回pending重算（增量规则）。
+    原实现两处断链：①原地改version=1行，历史版本丢失；
+    ②查询task_type='tts_generate'（下划线）与实际'tts-generate'永不匹配，
+    重TTS钩子从未触发过。两处均修复。"""
     u = db.query(m.Utterance).filter_by(uid=uid, project_id=pid).first()
     if not u: raise HTTPException(404)
-    lang = body.get("lang", "en")
-    t = (db.query(m.Translation)
-           .filter_by(utterance_id=u.id, target_lang=lang, version=1).first())
-    if not t:
-        t = m.Translation(utterance_id=u.id, target_lang=lang, version=1); db.add(t)
-    t.text = body["text"]
-    # 单句重算钩子：input_hash失效→下游TTS任务重排（DESIGN.md §7增量规则）
+    p = db.get(m.Project, pid)
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "text required")
+    lang = body.get("lang") or (p.target_lang if p else "en")
+    from ..translate_executor import count_syllables, syllable_ratio
+    last = (db.query(m.Translation)
+              .filter_by(utterance_id=u.id, target_lang=lang)
+              .order_by(m.Translation.version.desc()).first())
+    limit = ((p.config or {}).get("syllable_limit", 1.15) if p else 1.15)
+    ratio = syllable_ratio(text, u.merged_text or u.original_text or "", lang)
+    t = m.Translation(utterance_id=u.id, target_lang=lang,
+                      version=(last.version + 1) if last else 1, text=text,
+                      syllable_count=count_syllables(text, lang),
+                      syllable_ratio=ratio, is_over_limit=ratio > limit,
+                      llm_model="human", is_approved=True,
+                      prompt_version=last.prompt_version if last else None)
+    db.add(t)
     task = (db.query(m.PipelineTask)
-              .filter_by(segment_id=u.segment_id, task_type="tts_generate").first())
-    if task and task.status == "completed":
+              .filter_by(project_id=pid, segment_id=u.segment_id,
+                         task_type="tts-generate").first())
+    retts = False
+    if task and task.status in ("completed", "failed", "dead"):
         task.status = "pending"; task.input_hash = None; task.claimed_by = None
+        retts = True
     db.commit()
-    return {"ok": True, "retts_triggered": bool(task)}
+    return {"ok": True, "version": t.version, "ratio": round(ratio, 3),
+            "retts_triggered": retts}

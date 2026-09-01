@@ -64,6 +64,14 @@ def _tts_via_http(task: dict, payload: dict, engine: str, text: str,
     url = payload.get("engine_url") or os.getenv(
         "TTS_ENGINE_URL", "http://127.0.0.1:50000/tts")
     body = {"text": text, "lang": lang}
+    # G7：语气/情绪参数透传（payload此前只有text/lang/ref_audio，
+    # TTS语气全靠参考音隐式传递）。instruct→CosyVoice instruct_text；rate→speed。
+    if payload.get("instruct"):
+        body["instruct_text"] = payload["instruct"]
+        body["instruct"] = payload["instruct"]
+    if payload.get("rate"):
+        body["speed"] = payload["rate"]
+        body["rate"] = payload["rate"]
     if ref and os.path.exists(ref):
         # 引擎一般要 multipart/或 base64；两种都试，先走最简 JSON+ref_path（本机同机部署路径可见）
         body["ref_audio_path"] = ref
@@ -71,6 +79,8 @@ def _tts_via_http(task: dict, payload: dict, engine: str, text: str,
     if engine == "fish_api":
         req_body = {"text": text, "reference_audio": ref,
                     "reference_audio_path": ref, "format": "wav"}
+        if payload.get("rate"):
+            req_body["speed"] = payload["rate"]
     else:
         req_body = body
 

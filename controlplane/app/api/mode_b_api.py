@@ -115,12 +115,16 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
 def create_tts_task(pid: str, body: dict, db: Session = Depends(get_db)):
     """创建单句TTS测试任务（GPU节点claim执行）。
     body: {uid?: 指定句(默认第一句), engine?: cosyvoice_api|fish_api|mock,
-           engine_url?: 节点本机引擎地址, ref_audio?: 节点侧参考音频路径}
-    流程：取该句最新英文译文 → 建 pending 任务(gpu_required) → 节点轮询领取
-    → 完成后任务行 output_paths 存节点侧音频路径。"""
+           engine_url?: 节点本机引擎地址, ref_audio?: 节点侧参考音频路径,
+           speaker_id|speaker?: 角色（触发G8音色分配）,
+           emotion?: 情绪标签, instruct?: 语气指令, rate?: 语速因子}
+    流程：取该句最新英文译文 → (可选)assign_voice分配音色 → 建 pending 任务
+    (gpu_required) → 节点轮询领取 → 完成后节点artifact回传wav（G6），
+    output_paths 记录控制面侧产物路径 + tts_clips 落库。"""
     import datetime as _dt
-    from ..db.models import PipelineTask
+    from ..db.models import PipelineTask, Speaker
     from ..translate_executor import is_placeholder
+    from ..voice_assign import assign_voice
     p = db.get(Project, pid)
     if not p:
         raise HTTPException(404)
@@ -136,24 +140,42 @@ def create_tts_task(pid: str, body: dict, db: Session = Depends(get_db)):
                 .order_by(Translation.version.desc()).first())
     if not latest or is_placeholder(latest.text or ""):
         raise HTTPException(400, "target utterance has no valid translation")
+    # G8音色分配：显式body参数 > speaker档案分配 > 默认mock
+    spk = None
+    if body.get("speaker_id"):
+        spk = db.get(Speaker, body["speaker_id"])
+    elif body.get("speaker"):
+        spk = (db.query(Speaker)
+                 .filter(Speaker.project_id == pid,
+                         Speaker.label.in_([body["speaker"]])
+                         | Speaker.role_name.in_([body["speaker"]])).first())
+    voice = assign_voice(db, p, spk) if spk else {}
+    payload = {"text": latest.text, "lang": p.target_lang,
+               "engine": body.get("engine") or voice.get("engine") or "mock",
+               "engine_url": body.get("engine_url") or voice.get("engine_url"),
+               "ref_audio": body.get("ref_audio") or voice.get("ref_audio"),
+               "uid": target_u.uid}
+    for k in ("emotion", "instruct", "rate"):     # G7：语气/情绪参数进payload
+        v = body.get(k, voice.get(k))
+        if v is not None:
+            payload[k] = v
     task_key = f"TTS-TEST/{target_u.uid}/{int(_dt.datetime.now().timestamp())}"
     t = PipelineTask(
         project_id=pid, task_key=task_key, task_type="tts-generate",
         resource="gpu", gpu_required=True, weight=5, depends_on=[],
-        input_hash=f"tts-test:{target_u.uid}:{latest.version}",
+        input_hash=(f"tts-test:{target_u.uid}:{latest.version}:"
+                    f"{payload['engine']}:{payload.get('instruct') or ''}"),
         status="pending",
-        output_paths={"payload": {
-            "text": latest.text, "lang": p.target_lang,
-            "engine": body.get("engine", "mock"),
-            "engine_url": body.get("engine_url"),
-            "ref_audio": body.get("ref_audio"),
-            "uid": target_u.uid,
-        }})
+        output_paths={"payload": payload})
     db.add(t)
     db.commit()
     return {"ok": True, "task_id": t.id, "task_key": task_key,
-            "text": latest.text[:80],
-            "note": "节点启动 gpunode/entrypoint.py 后自动领取执行"}
+            "text": latest.text[:80], "voice": {k: v for k, v in payload.items()
+                                                if k in ("engine", "engine_url",
+                                                         "ref_audio", "emotion",
+                                                         "instruct", "rate")},
+            "note": "节点启动 gpunode/entrypoint.py 后自动领取执行；"
+                    "产物经 /api/nodes/tasks/{id}/artifact 回传"}
 
 
 @router.get("/projects/{pid}/mode-b/package")

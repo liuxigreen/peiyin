@@ -281,6 +281,27 @@ def _parse_fixes(model_out: str) -> dict[int, str]:
 
 
 # ── 上下文包（T205）────────────────────────────────────────
+def _voice_meta(s: Speaker) -> dict:
+    """speaker 卡的声线元数据（C0提取落库在 ref_audio_pool[0]：gender/age_band/timbre）。"""
+    pool = s.ref_audio_pool or []
+    meta = pool[0] if (isinstance(pool, list) and pool
+                       and isinstance(pool[0], dict)) else {}
+    return {"gender": meta.get("gender") or "unknown",
+            "age_band": meta.get("age_band") or "unknown",
+            "timbre": meta.get("timbre") or ""}
+
+
+def _card_str(c: dict) -> str:
+    """角色卡一行字符串：role_name + 声线元数据（喂给R2/R3做语气与人设锚）。"""
+    meta = [m for m in (c.get("gender"), c.get("age_band"))
+            if m and m not in ("", "unknown")]
+    if c.get("timbre"):
+        meta.append("音色:" + c["timbre"])
+    if c.get("is_primary"):
+        meta.insert(0, "主角")
+    return c["role_name"] + ("(" + "/".join(meta) + ")" if meta else "")
+
+
 def build_ctx_pack(db: Session, project: Project, utts: list[Utterance]) -> dict:
     """术语表 + 出现过的说话人卡 + 目标语种。轻量确定性，无LLM。"""
     terms = (db.query(GlossaryTerm)
@@ -297,7 +318,9 @@ def build_ctx_pack(db: Session, project: Project, utts: list[Utterance]) -> dict
     return {
         "target_lang": project.target_lang,
         "glossary": {t.source_term: t.target_term for t in terms},
-        "role_cards": [{"label": s.label, "role_name": s.role_name or s.label} for s in spks],
+        "role_cards": [{"label": s.label, "role_name": s.role_name or s.label,
+                        "is_primary": bool(s.is_primary), **_voice_meta(s)}
+                       for s in spks],
         "prompt_version": f"tpl:{tpl.id[:8]}" if tpl else "builtin:v1",
         "template": tpl.content if tpl else None,
     }
@@ -360,17 +383,51 @@ def _budget_block(chunk: list[int], budget: dict[int, int] | None) -> str:
             + ", ".join(f"{i}→{budget[idx]}" for i, idx in enumerate(chunk, 1)) + "\n")
 
 
+# ── 句特征路由（G3）：不同特征的句子走不同翻译策略 ──────────
+_NUM_ONLY_RE = re.compile(r"^[\d\s:：,.，。%．\-—~～+/()（）]+$")
+
+
+def _line_feats(utts: list[Utterance], chunk: list[int],
+                gloss_keys: set[str] | None) -> dict[int, str]:
+    """给块内特殊行打特征标签：纯数字行/人名句/超短句。
+    R1→R2此前只传文本，模型把 '08:30' 译成 'half past eight' 或把人名意译的
+    事故都源于此。key=块内行号（1起）。"""
+    out: dict[int, str] = {}
+    for i, idx in enumerate(chunk, 1):
+        src = (_src_of(utts[idx]) or "").strip()
+        f: list[str] = []
+        if src and _NUM_ONLY_RE.match(src):
+            f.append("纯数字/时间行：保留数字格式直接转写")
+        elif gloss_keys and src in gloss_keys:
+            f.append("人名句：直接输出术语表指定译名")
+        elif 0 < len(src) <= 4:
+            f.append("超短句：逐字保留力度，语气词全删")
+        if f:
+            out[i] = "；".join(f)
+    return out
+
+
+def _feature_block(feats: dict[int, str] | None) -> str:
+    if not feats:
+        return ""
+    return ("句特征(特殊行按标注处理): "
+            + ", ".join(f"{k}→{v}" for k, v in feats.items()) + "\n")
+
+
 async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
                            utts: list[Utterance], chunk: list[int],
                            gloss: str, cards: str,
                            budget: dict[int, int] | None,
                            prev_tail: list[str],
                            r2_cfg: dict | None = None,
-                           prev_scenes_ctx: str = "") -> tuple[dict[int, str], list[str]]:
+                           prev_scenes_ctx: str = "",
+                           gloss_keys: set[str] | None = None,
+                           ) -> tuple[dict[int, str], list[str]]:
     """一个块的多Agent协作链（v1.0）：
     R1直译=主力M3(最快) → R2本地化意译=专职模型(r2_cfg,默认DeepSeek-V3,习语地道化最强)
     → R3增量终检=M3。返回 {utterance下标: 文本} 与尾部译文。"""
     lines = [f"{i+1} | {_src_of(utts[idx])}" for i, idx in enumerate(chunk)]
+    feats = _line_feats(utts, chunk, gloss_keys)
 
     def _merge(best: dict[int, str], alt: dict[int, str]) -> int:
         """用 alt 补 best 里的缺失行，返回补上的行数。"""
@@ -402,7 +459,7 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
     r2cfg = r2_cfg or provider
     r2 = await chat(r2cfg, f"{_R2_SYS}\n{lang_rule}",
                     f"{prev_scenes_ctx}前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
-                    + _budget_block(chunk, budget)
+                    + _budget_block(chunk, budget) + _feature_block(feats)
                     + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk))))
     t2 = _parse_numbered(r2, len(chunk))
     if any(_is_ph(v) for v in t2.values()):
@@ -413,7 +470,7 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
                                          "注意：只输出 'N | 译文' 格式的行，"
                                          "不要任何解释、前言或多余文本。",
                                          f"{prev_scenes_ctx}前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
-                                         + _budget_block(chunk, budget)
+                                         + _budget_block(chunk, budget) + _feature_block(feats)
                                          + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk)))),
                               len(chunk))
         _merge(t2, t2b)
@@ -447,7 +504,8 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
                               prev_tail: list[str],
                               stats: dict,
                               fallback_chain: list[dict] | None = None,
-                              r2_step_cfg: dict | None = None
+                              r2_step_cfg: dict | None = None,
+                              gloss_keys: set[str] | None = None,
                               ) -> tuple[dict[int, str], list[str]]:
     """块执行+段级兜底链（v0.9）：任一失败（审查/网络/格式漂移）→
     当场换下一个模型重跑同一块，绝不重跑整个场景。
@@ -462,7 +520,7 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
         try:
             texts, tail = await _run_chunk_chain(cand, ctx, lang_rule, utts, chunk,
                                                  gloss, cards, budget, prev_tail,
-                                                 r2_cfg=r2cfg)
+                                                 r2_cfg=r2cfg, gloss_keys=gloss_keys)
             if ci > 0:
                 stats["fallback_used"] += 1
                 log.warning("chunk=%s 主provider失败(%s) → 兜底#%d(%s)救援成功",
@@ -487,7 +545,8 @@ async def _run_chunk_filtered(provider: dict, ctx: dict, lang_rule: str,
             for half in (chunk[:mid], chunk[mid:]):
                 t2, tail2 = await _run_chunk_filtered(
                     provider, ctx, lang_rule, utts, half, gloss, cards,
-                    budget, tail, stats, fallback_chain, r2_step_cfg)
+                    budget, tail, stats, fallback_chain, r2_step_cfg,
+                    gloss_keys)
                 texts.update(t2)
                 if tail2:
                     tail = tail2
@@ -524,9 +583,11 @@ async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
                           utts: list[Utterance], part: list[int],
                           written: dict[int, dict], budget: dict[int, int] | None,
                           target: str, limit: float, ctx: dict,
-                          model_tag: str | None = None) -> bool:
+                          model_tag: str | None = None,
+                          touched: list[int] | None = None) -> bool:
     """一轮压缩：把超限行压缩到预算内，写新版本（没变短不写）。
-    返回 False=被内容审查拒绝（上层换下一兜底模型重试）。"""
+    返回 False=被内容审查拒绝（上层换下一兜底模型重试）。
+    touched：本轮实际写了压缩版的行下标（G5终检只review这些行）。"""
     lines, pairs = [], []
     for i, idx in enumerate(part, 1):
         lines.append(f"{i} | {written[idx]['text']}")
@@ -551,7 +612,72 @@ async def _compress_chunk(db: Session, provider: dict, lang_rule: str,
                            {**provider, "model": model_tag or provider["model"]}, limit)
         written[idx] = {"text": new_text, "ratio": new_ratio}
         wrote = True
+        if touched is not None:
+            touched.append(idx)
     return True
+
+
+async def _review_compressed(db: Session, provider: dict, lang_rule: str,
+                             utts: list[Utterance], idxs: list[int],
+                             written: dict[int, dict], ctx: dict,
+                             target: str, limit: float, model_tag: str) -> int:
+    """G5修复：压缩产物补过R3终检（原压缩闭环跳过终检，语义漂移无人把关）。
+    增量协议只收修改行；修正行写version+1（llm_model带review标记），
+    修正导致音节比恶化且超限的不收。返回实际修正行数。"""
+    if not idxs:
+        return 0
+    try:
+        rv = await chat(provider, f"{_RV_SYS}\n{lang_rule}",
+                        "全部台词(压缩后译):\n"
+                        + "\n".join(f"{n} | {written[i]['text']}"
+                                    for n, i in enumerate(idxs, 1)))
+        fixes = _parse_fixes(rv)
+    except ContentFilteredError:
+        return 0                    # 终检被滤→保留压缩结果（压缩已成功，不算失败）
+    fixed = 0
+    for n, i in enumerate(idxs, 1):
+        fx = (fixes.get(n) or "").strip()
+        if not fx or _PLACEHOLDER_RE.match(fx) or fx == written[i]["text"]:
+            continue
+        new_ratio = syllable_ratio(fx, _src_of(utts[i]), target)
+        if new_ratio > limit and new_ratio >= written[i]["ratio"]:
+            continue                # 修正把音节比改差且超限：拒绝
+        _write_translation(db, utts[i], target, fx, new_ratio, ctx,
+                           {**provider, "model": model_tag + "|review"}, limit)
+        written[i] = {"text": fx, "ratio": new_ratio}
+        fixed += 1
+    return fixed
+
+
+def _prev_scene_ctx(db: Session, project: Project, scene_key: str, target: str) -> str:
+    """前一场景尾部8句（G2修复：取每句最新版本译文，跳占位符）。
+    原实现硬编码 version==1——全量重跑后最新版本是v4+，跨场景上下文静默失效。"""
+    if not scene_key or scene_key == "SC01":
+        return ""
+    try:
+        prev_idx = int(scene_key[2:]) - 1
+    except ValueError:
+        return ""
+    if prev_idx < 1:
+        return ""
+    rows = (db.query(Utterance.id, Utterance.seq_index, Translation.version,
+                     Translation.text)
+              .join(Translation, Translation.utterance_id == Utterance.id)
+              .filter(Utterance.uid.like(f"SC{prev_idx:02d}-%"),
+                      Translation.target_lang == target)
+              .all())
+    best: dict[str, tuple[int, int, str]] = {}      # utterance_id -> (seq, ver, text)
+    for uid_, seq, ver, text in rows:
+        if not text or is_placeholder(text):
+            continue
+        cur = best.get(uid_)
+        if cur is None or ver > cur[1]:
+            best[uid_] = (seq, ver, text)
+    if not best:
+        return ""
+    tail_lines = [t for _, _, t in sorted(best.values())][-8:]
+    return ("前一场景结尾（保持剧情与称呼连贯）:\n"
+            + "\n".join(f"- {s}" for s in tail_lines) + "\n")
 
 
 async def run_translate_scene(db: Session, project: Project, scene_key: str) -> dict:
@@ -572,24 +698,13 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
     limit = (project.config or {}).get("syllable_limit", 1.15)
     batch_size = max(1, int((project.config or {}).get("batch_size", 10)))
     gloss = "\n".join(f"- {k} → {v}" for k, v in ctx["glossary"].items()) or "（无）"
-    cards = "；".join(c["role_name"] for c in ctx["role_cards"]) or "（未标注）"
+    gloss_keys = set(ctx["glossary"])
+    cards = "；".join(_card_str(c) for c in ctx["role_cards"]) or "（未标注）"
     lang_rule = _lang_rule(target)
     budget = _budget_map(utts, target, limit)
     # 滑动窗口上下文（外部架构评审采纳）：场景开头给前情概览（前一场景尾部8句），
     # 解决跨场景指代/人称衔接；本场景内部 prev_tail 逐块滚动已有
-    prev_scenes_ctx = ""
-    if scene_key and scene_key != "SC01":
-        prev_uid_hi = int(scene_key[2:]) - 1
-        prev_rows = (db.query(Translation.text)
-                       .join(Utterance, Translation.utterance_id == Utterance.id)
-                       .filter(Utterance.uid.like(f"SC{prev_uid_hi:02d}-%"),
-                               Translation.target_lang == target,
-                               Translation.version == 1)
-                       .order_by(Utterance.seq_index.desc()).limit(8).all())
-        if prev_rows:
-            tail_lines = [r[0] for r in prev_rows][:8]
-            prev_scenes_ctx = ("前一场景结尾（保持剧情与称呼连贯）:\n"
-                               + "\n".join(f"- {s}" for s in reversed(tail_lines)) + "\n")
+    prev_scenes_ctx = _prev_scene_ctx(db, project, scene_key, target)
 
     n = len(utts)
     fallback_chain = load_fallback_providers(db)
@@ -607,7 +722,7 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
         chunk = list(range(start, min(start + batch_size, n)))
         texts, new_tail = await _run_chunk_filtered(
             provider, ctx, lang_rule, utts, chunk, gloss, cards, budget, tail,
-            stats, fallback_chain, r2_step_cfg)
+            stats, fallback_chain, r2_step_cfg, gloss_keys)
         finals.update(texts)
         if new_tail:
             tail = new_tail
@@ -647,6 +762,7 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
             _comp_seen.append(mkey)
             comp_candidates.append(c)
     rounds = 0
+    comp_lines: list[int] = []
     for _ in range(2):
         over = [i for i in sorted(written) if written[i]["ratio"] > limit]
         if not over:
@@ -657,10 +773,17 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
             for cand in comp_candidates:
                 ok = await _compress_chunk(db, cand, lang_rule, utts, part, written,
                                            budget, target, limit, ctx,
-                                           model_tag=model_tag + "|compress:" + cand["model"])
+                                           model_tag=model_tag + "|compress:" + cand["model"],
+                                           touched=comp_lines)
                 if ok:
                     break
         db.commit()
+
+    # G5修复：压缩产物补过终检（压缩跳过R3曾导致语义漂移无人把关）
+    review_fixes = await _review_compressed(db, provider, lang_rule, utts,
+                                            sorted(set(comp_lines)), written,
+                                            ctx, target, limit, model_tag)
+    db.commit()
 
     return {"scene": scene_key, "utterances": len(written),
             "provider": provider["name"], "mode": provider["mode"],
@@ -670,7 +793,9 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
                          for i in isolated],
             "filtered_chunks": stats["filtered_chunks"],
             "fallback_used": stats["fallback_used"],
-            "compression_rounds": rounds}
+            "compression_rounds": rounds,
+            "compressed_lines": len(set(comp_lines)),
+            "compression_review_fixes": review_fixes}
 
 
 async def run_translate_project(project_id: str, scenes: list[str],

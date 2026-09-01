@@ -4,7 +4,7 @@ register / claim(原子领取) / heartbeat / complete / fail / 节点列表
 status条件更新实现同语义——两方言均保证不重复派发。"""
 import hashlib, os, secrets
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import text as satext
 from sqlalchemy.orm import Session
 from ..db.session import get_db
@@ -119,13 +119,101 @@ def complete(task_id: str, body: dict, authorization: str = Header(default=""),
     if t.claimed_by and t.claimed_by != node.id:
         raise HTTPException(409, "task was reassigned; stale result discarded")
     t.status = "completed"
-    t.output_paths = body.get("outputs", {})
+    # G6配套：outputs写入+payload保留。历史两处数据丢失：
+    # ①节点dispatch发的是列表，整行赋值后qc钩子判定非dict→output_paths只剩{"qc"}；
+    # ②即便dict也被整行覆盖，artifact回传时payload里的uid/engine已丢失。
+    body_out = body.get("outputs", {})
+    payload = (t.output_paths or {}).get("payload")
+    outs = {"outputs": body_out} if isinstance(body_out, list) else dict(body_out)
+    if payload is not None and "payload" not in outs:
+        outs["payload"] = payload
+    t.output_paths = outs
     t.output_hash = body.get("output_hash")
     t.lease_until = None
     db.commit()
     from ..qc_agent import run_qc_hook
     qc = run_qc_hook(t, db)          # 节点完成路径同样过QC Agent
     return {"ok": True, "qc_pass": qc["pass"], "qc_action": qc["action"]}
+
+
+_ART_MAX_MB = int(os.getenv("NODE_ARTIFACT_MAX_MB", "80"))
+
+
+@router.post("/tasks/{task_id}/artifact")
+async def upload_artifact(task_id: str, request: "Request", filename: str = "",
+                          key: str = "", authorization: str = Header(default=""),
+                          db: Session = Depends(get_db)):
+    """G6产物回传：节点把wav等产物POST回控制面（raw body流式落盘，
+    免multipart依赖）。保存到 MODE_B_STORAGE/artifacts/{task_id}/，
+    合并进 task.output_paths.artifacts；tts-generate 任务同时落 tts_clips 行
+    （此前output_paths只有节点本地路径，控制面拿不到音频文件，交付包断供）。"""
+    node = _auth_node(db, authorization)
+    t = db.get(m.PipelineTask, task_id)
+    if not t:
+        raise HTTPException(404)
+    if t.claimed_by and t.claimed_by != node.id:
+        raise HTTPException(409, "task not claimed by this node")
+    storage = os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+    dest_dir = os.path.join(storage, "artifacts", task_id)
+    os.makedirs(dest_dir, exist_ok=True)
+    fname = os.path.basename(filename or f"{t.task_key}.bin") or "artifact.bin"
+    dest = os.path.join(dest_dir, fname)
+    size = 0
+    with open(dest, "wb") as f:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > _ART_MAX_MB << 20:
+                f.close()
+                os.remove(dest)
+                raise HTTPException(413, f"artifact exceeds {_ART_MAX_MB}MB")
+            f.write(chunk)
+    entry = {"key": key or fname, "path": dest, "bytes": size}
+    outs = dict(t.output_paths or {})
+    arts = [a for a in (outs.get("artifacts") or []) if a.get("key") != entry["key"]]
+    arts.append(entry)
+    outs["artifacts"] = arts          # JSON列整体重赋值（原地改不落库，HANDOVER坑#4）
+    t.output_paths = outs
+    clip_info = _upsert_tts_clip(db, t, dest)
+    db.commit()
+    return {"ok": True, "artifact": entry, "tts_clip": clip_info}
+
+
+def _upsert_tts_clip(db: Session, t: "m.PipelineTask", path: str) -> dict | None:
+    """tts-generate任务的产物回传→tts_clips落库（交付包/试听的数据源）。"""
+    if t.task_type != "tts-generate":
+        return None
+    payload = (t.output_paths or {}).get("payload") or {}
+    uid_ = payload.get("uid")
+    if not uid_:
+        return None
+    u = db.query(m.Utterance).filter_by(project_id=t.project_id, uid=uid_).first()
+    if not u:
+        return None
+    tr = (db.query(m.Translation)
+            .filter_by(utterance_id=u.id, target_lang=payload.get("lang") or "en")
+            .order_by(m.Translation.version.desc()).first())
+    if not tr:
+        return None
+    dur_ms = 0
+    try:
+        import soundfile as _sf
+        info = _sf.info(path)
+        dur_ms = int(info.frames / info.samplerate * 1000)
+    except Exception:                                        # noqa: BLE001
+        pass
+    engine = payload.get("engine") or "mock"
+    row = (db.query(m.TtsClip)
+             .filter_by(utterance_id=u.id, target_lang=tr.target_lang,
+                        version=tr.version, tts_engine=engine).first())
+    if row is None:
+        row = m.TtsClip(utterance_id=u.id, target_lang=tr.target_lang,
+                        translation_id=tr.id, version=tr.version,
+                        tts_engine=engine)
+        db.add(row)
+    row.audio_r2_key = path          # R2未启用阶段存控制面本地路径
+    row.duration_ms = dur_ms
+    row.status = "completed"
+    return {"clip_id": row.id, "duration_ms": dur_ms, "engine": engine}
 
 @router.post("/tasks/{task_id}/fail")
 def fail(task_id: str, body: dict, authorization: str = Header(default=""),

@@ -41,6 +41,36 @@ def _task_heartbeat_loop(tid: str, stop: list):
             print("[task-hb] fail:", e)
 
 
+ART_MAX_MB = int(os.getenv("NODE_ARTIFACT_MAX_MB", "80"))
+
+
+def upload_artifacts(tid: str, outputs):
+    """G6产物回传：outputs里节点本地文件POST回控制面（raw body，免multipart）。
+    失败仅告警——complete已成功，控制面仍可按 output_paths 里节点侧path补拉。"""
+    import os as _os
+    for o in (outputs if isinstance(outputs, list) else []):
+        p = (o or {}).get("path")
+        if not p or not _os.path.isfile(p):
+            continue
+        try:
+            sz = _os.path.getsize(p)
+            if sz > ART_MAX_MB << 20:
+                print(f"[art] skip >{ART_MAX_MB}MB: {p}")
+                continue
+            with open(p, "rb") as f:
+                data = f.read()
+            r = httpx.post(
+                f"{CONTROL}/api/nodes/tasks/{tid}/artifact",
+                params={"filename": _os.path.basename(p), "key": o.get("key", "")},
+                headers={"Authorization": f"Bearer {state['token']}",
+                         "Content-Type": "application/octet-stream"},
+                content=data, timeout=300)
+            r.raise_for_status()
+            print(f"[art] uploaded {_os.path.basename(p)} ({sz >> 10}KB)")
+        except Exception as e:
+            print("[art] upload fail:", e)
+
+
 def dispatch(task: dict):
     tid, ttype = task["id"], task["task_type"]
     # payload/pipeline_task payload 字段统一注入 task 顶层（stages 按 task["payload"] 取参）
@@ -57,6 +87,7 @@ def dispatch(task: dict):
                    headers={"Authorization": f"Bearer {state['token']}"},
                    json={"outputs": outputs})
         print(f"[ok] {ttype} {tid[:8]}")
+        upload_artifacts(tid, outputs)         # G6：产物文件回传控制面
     except Exception as e:
         retryable = "OOM" not in str(e).upper()
         httpx.post(f"{CONTROL}/api/nodes/tasks/{tid}/fail",
