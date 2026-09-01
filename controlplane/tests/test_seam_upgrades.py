@@ -422,3 +422,30 @@ def test_tts_requeue_skips_dead_by_default(tmp_path):
     assert c.post(f"/api/projects/{pid}/mode-b/tts-requeue", json={}).json()["requeued"] == 0
     assert c.post(f"/api/projects/{pid}/mode-b/tts-requeue",
                   json={"include_dead": True}).json()["requeued"] == 1
+
+
+# ── wave2.3：rate/emotion进缓存键 + uids精选重跑 ─────────────
+def test_tts_batch_rate_in_hash_and_uids(tmp_path):
+    c = _client(str(tmp_path / "w7.db"))
+    pid = _seed_translated(c, "语速剧", scene_size=40)
+    utts = c.get(f"/api/projects/{pid}/utterances?lang=en").json()
+    uids = [u["uid"] for u in utts[:2]]
+    r1 = c.post(f"/api/projects/{pid}/mode-b/tts-batch",
+                json={"uids": uids, "engine": "cosyvoice_api"}).json()
+    assert r1["created"] == 2, r1
+    r2 = c.post(f"/api/projects/{pid}/mode-b/tts-batch",
+                json={"uids": uids, "engine": "cosyvoice_api", "rate": 1.25}).json()
+    assert r2["created"] == 2, r2          # rate不同→新hash→重新合成
+    r3 = c.post(f"/api/projects/{pid}/mode-b/tts-batch",
+                json={"uids": uids, "engine": "cosyvoice_api", "rate": 1.25}).json()
+    assert r3["created"] == 0 and r3["skipped"] == 2, r3
+    from app.db.models import PipelineTask
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        pay = [t.output_paths["payload"] for t in
+               db.query(PipelineTask).filter_by(project_id=pid, task_type="tts-generate").all()]
+        rates = sorted(p["rate"] for p in pay if "rate" in p)
+        assert rates == [1.25, 1.25], pay
+    finally:
+        db.close()

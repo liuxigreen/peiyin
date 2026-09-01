@@ -203,9 +203,13 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
     scene = body.get("scene")
     if scene:
         utts = [u for u in utts if (u.uid or "").startswith(f"{scene}-")]
+    if body.get("uids"):
+        want = set(body["uids"])
+        utts = [u for u in utts if u.uid in want]
     limit = int(body.get("limit") or 0)
     created = skipped = no_translation = 0
     import datetime as _dt
+    import uuid as _uuid
     ts = int(_dt.datetime.now().timestamp())
     for n, u in enumerate(utts):
         if limit and created >= limit:
@@ -218,7 +222,8 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
             continue
         payload, _ = _tts_payload(db, p, u, latest, body)
         ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"
-              f"{payload.get('instruct') or ''}:{payload.get('ref_audio') or ''}")
+              f"{payload.get('instruct') or ''}:{payload.get('ref_audio') or ''}:"
+              f"{payload.get('rate') or ''}:{payload.get('emotion') or ''}")
         dup = (db.query(PipelineTask)
                  .filter(PipelineTask.project_id == pid,
                          PipelineTask.input_hash == ih,
@@ -227,7 +232,7 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
             skipped += 1
             continue
         db.add(PipelineTask(
-            project_id=pid, task_key=f"TTS-B/{u.uid}/{ts + n}",
+            project_id=pid, task_key=f"TTS-B/{u.uid}/{ts}{_uuid.uuid4().hex[:4]}",
             task_type="tts-generate", resource="gpu", gpu_required=True,
             weight=1, depends_on=[], input_hash=ih, status="pending",
             output_paths={"payload": payload}))
