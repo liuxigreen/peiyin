@@ -331,13 +331,26 @@ _COMP_SYS = ("你是配音字幕压缩员。把每行译文压缩到目标音节
 _LATIN_TARGETS = ("en", "es", "pt", "id", "th", "vi", "ms", "fr", "de", "it")
 
 
+# 拉丁语自然语速上限（音节/秒）：英语配音行业常用 5.5-6.5，取 6.0；法语德语相近
+_SYL_PER_SEC = 6.0
+
+
 def _budget_map(utts: list[Utterance], target_lang: str,
                 limit: float) -> dict[int, int] | None:
-    """拉丁语目标给出每句音节预算（zh/ja/ko节奏不同，不给）。key=utterance下标。"""
+    """拉丁语目标给出每句音节预算（zh/ja/ko节奏不同，不给）。key=utterance下标。
+    v1.2 时长基准（外部架构评审采纳）：有真实时长(end_ms>start_ms)的台词
+    预算 = 时长秒数 × 语速上限(6音节/秒) ×1.15余量；时长缺失/为零时退回
+    中文音节比 × limit。时长基准直接对齐配音窗口，是配音行业的真约束。"""
     if not any(target_lang.startswith(p) for p in _LATIN_TARGETS):
         return None
-    return {i: max(1, int(count_syllables(_src_of(u), "zh") * limit))
-            for i, u in enumerate(utts)}
+    out = {}
+    for i, u in enumerate(utts):
+        dur = (u.end_ms or 0) - (u.start_ms or 0)
+        if dur > 300:                       # >0.3s 才是可信的真实时长
+            out[i] = max(2, int(dur / 1000 * _SYL_PER_SEC * limit))
+        else:
+            out[i] = max(1, int(count_syllables(_src_of(u), "zh") * limit))
+    return out
 
 
 def _budget_block(chunk: list[int], budget: dict[int, int] | None) -> str:
@@ -352,7 +365,8 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
                            gloss: str, cards: str,
                            budget: dict[int, int] | None,
                            prev_tail: list[str],
-                           r2_cfg: dict | None = None) -> tuple[dict[int, str], list[str]]:
+                           r2_cfg: dict | None = None,
+                           prev_scenes_ctx: str = "") -> tuple[dict[int, str], list[str]]:
     """一个块的多Agent协作链（v1.0）：
     R1直译=主力M3(最快) → R2本地化意译=专职模型(r2_cfg,默认DeepSeek-V3,习语地道化最强)
     → R3增量终检=M3。返回 {utterance下标: 文本} 与尾部译文。"""
@@ -387,7 +401,7 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
     prev3 = "\n".join(prev_tail[-3:]) if prev_tail else "（无）"
     r2cfg = r2_cfg or provider
     r2 = await chat(r2cfg, f"{_R2_SYS}\n{lang_rule}",
-                    f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
+                    f"{prev_scenes_ctx}前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
                     + _budget_block(chunk, budget)
                     + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk))))
     t2 = _parse_numbered(r2, len(chunk))
@@ -398,7 +412,7 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
         t2b = _parse_numbered(await chat(r2cfg, f"{_R2_SYS}\n{lang_rule}\n"
                                          "注意：只输出 'N | 译文' 格式的行，"
                                          "不要任何解释、前言或多余文本。",
-                                         f"前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
+                                         f"{prev_scenes_ctx}前文译文（保持连贯）:\n{prev3}\n角色: {cards}\n"
                                          + _budget_block(chunk, budget)
                                          + "第一轮直译:\n" + "\n".join(f"{i+1} | {t1[i+1]}" for i in range(len(chunk)))),
                               len(chunk))
@@ -412,7 +426,7 @@ async def _run_chunk_chain(provider: dict, ctx: dict, lang_rule: str,
 
     try:
         rv = await chat(provider, f"{_RV_SYS}\n{lang_rule}",
-                        "全部台词(R2译):\n"
+                        f"{prev_scenes_ctx}全部台词(R2译):\n"
                         + "\n".join(f"{i+1} | {t2[i+1]}" for i in range(len(chunk))))
         fixes = _parse_fixes(rv)
     except ContentFilteredError:
@@ -561,6 +575,21 @@ async def run_translate_scene(db: Session, project: Project, scene_key: str) -> 
     cards = "；".join(c["role_name"] for c in ctx["role_cards"]) or "（未标注）"
     lang_rule = _lang_rule(target)
     budget = _budget_map(utts, target, limit)
+    # 滑动窗口上下文（外部架构评审采纳）：场景开头给前情概览（前一场景尾部8句），
+    # 解决跨场景指代/人称衔接；本场景内部 prev_tail 逐块滚动已有
+    prev_scenes_ctx = ""
+    if scene_key and scene_key != "SC01":
+        prev_uid_hi = int(scene_key[2:]) - 1
+        prev_rows = (db.query(Translation.text)
+                       .join(Utterance, Translation.utterance_id == Utterance.id)
+                       .filter(Utterance.uid.like(f"SC{prev_uid_hi:02d}-%"),
+                               Translation.target_lang == target,
+                               Translation.version == 1)
+                       .order_by(Utterance.seq_index.desc()).limit(8).all())
+        if prev_rows:
+            tail_lines = [r[0] for r in prev_rows][:8]
+            prev_scenes_ctx = ("前一场景结尾（保持剧情与称呼连贯）:\n"
+                               + "\n".join(f"- {s}" for s in reversed(tail_lines)) + "\n")
 
     n = len(utts)
     fallback_chain = load_fallback_providers(db)
