@@ -111,6 +111,51 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
             "scenes_translated": len(tr_results)}
 
 
+@router.post("/projects/{pid}/mode-b/tts-task")
+def create_tts_task(pid: str, body: dict, db: Session = Depends(get_db)):
+    """创建单句TTS测试任务（GPU节点claim执行）。
+    body: {uid?: 指定句(默认第一句), engine?: cosyvoice_api|fish_api|mock,
+           engine_url?: 节点本机引擎地址, ref_audio?: 节点侧参考音频路径}
+    流程：取该句最新英文译文 → 建 pending 任务(gpu_required) → 节点轮询领取
+    → 完成后任务行 output_paths 存节点侧音频路径。"""
+    import datetime as _dt
+    from ..db.models import PipelineTask
+    from ..translate_executor import is_placeholder
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    utts = (db.query(Utterance).filter_by(project_id=pid)
+              .order_by(Utterance.seq_index).all())
+    uid_filter = body.get("uid")
+    target_u = next((u for u in utts if u.uid == uid_filter), None) if uid_filter else (
+        utts[0] if utts else None)
+    if not target_u:
+        raise HTTPException(400, "no utterance")
+    latest = (db.query(Translation)
+                .filter_by(utterance_id=target_u.id, target_lang=p.target_lang)
+                .order_by(Translation.version.desc()).first())
+    if not latest or is_placeholder(latest.text or ""):
+        raise HTTPException(400, "target utterance has no valid translation")
+    task_key = f"TTS-TEST/{target_u.uid}/{int(_dt.datetime.now().timestamp())}"
+    t = PipelineTask(
+        project_id=pid, task_key=task_key, task_type="tts-generate",
+        resource="gpu", gpu_required=True, weight=5, depends_on=[],
+        input_hash=f"tts-test:{target_u.uid}:{latest.version}",
+        status="pending",
+        output_paths={"payload": {
+            "text": latest.text, "lang": p.target_lang,
+            "engine": body.get("engine", "mock"),
+            "engine_url": body.get("engine_url"),
+            "ref_audio": body.get("ref_audio"),
+            "uid": target_u.uid,
+        }})
+    db.add(t)
+    db.commit()
+    return {"ok": True, "task_id": t.id, "task_key": task_key,
+            "text": latest.text[:80],
+            "note": "节点启动 gpunode/entrypoint.py 后自动领取执行"}
+
+
 @router.get("/projects/{pid}/mode-b/package")
 def get_package(pid: str, db: Session = Depends(get_db)):
     p = db.get(Project, pid)

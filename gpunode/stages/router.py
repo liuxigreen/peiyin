@@ -23,4 +23,5 @@ if _MODE == "offline":
     from . import offline as _impl  # noqa: F401,E402
 else:
     from . import demo as _impl     # noqa: F401,E402
+    from . import tts_node as _tts  # noqa: F401,E402  # TTS节点：3060等GPU机器
     # G0: from . import real stages here

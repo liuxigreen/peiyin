@@ -43,6 +43,9 @@ def _task_heartbeat_loop(tid: str, stop: list):
 
 def dispatch(task: dict):
     tid, ttype = task["id"], task["task_type"]
+    # payload/pipeline_task payload 字段统一注入 task 顶层（stages 按 task["payload"] 取参）
+    if "payload" not in task:
+        task["payload"] = task.get("input_payload") or {}
     stop_flag = [False]
     import threading
     hb = threading.Thread(target=_task_heartbeat_loop, args=(tid, stop_flag), daemon=True)
