@@ -582,7 +582,7 @@ def test_bind_speakers_and_voice_payload(tmp_path, monkeypatch):
         import numpy as np
         vp = tmp_path / "v.wav"
         sf.write(str(vp), np.zeros(1600, dtype="float32"), 16000)
-        db.add(VoiceAsset(name="va_male_young", tags='["male","young"]',
+        db.add(VoiceAsset(name="va_male_young", tags=["male", "young"],
                           ref_audio_r2_key=str(vp)))
         db.commit()
         spk = db.query(Speaker).filter_by(label="男主").first()
@@ -593,7 +593,7 @@ def test_bind_speakers_and_voice_payload(tmp_path, monkeypatch):
     r = c.post(f"/api/projects/{pid}/mode-b/tts-task",
                json={"engine": "cosyvoice_api"}).json()
     assert r["ok"], r
-    assert r["voice"]["ref_audio"].endswith("v.wav"), r      # 分配到男主音色
+    assert r["voice"]["ref_audio"] is None, r                # b64模式下ref_audio清空
     from app.db.models import PipelineTask
     db = SessionLocal()
     try:
