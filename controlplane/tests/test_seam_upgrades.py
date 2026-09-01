@@ -603,3 +603,37 @@ def test_bind_speakers_and_voice_payload(tmp_path, monkeypatch):
         assert pay.get("voice_id"), pay
     finally:
         db.close()
+
+
+# ── wave4.1：timbre关键词区分同性别同年龄段角色 ───────────────
+def test_voice_assign_timbre_keywords(tmp_path):
+    c = _client(str(tmp_path / "w12.db"))
+    pid = _seed_translated(c, "声线剧", scene_size=40)
+    from app.db.models import Speaker, VoiceAsset
+    from app.db.session import SessionLocal
+    from app.voice_assign import assign_voice
+    db = SessionLocal()
+    try:
+        p = db.get_project = None
+        from app.db.models import Project
+        p = db.get(Project, pid)
+        db.add(Speaker(project_id=pid, label="冷面男", role_name="A", is_primary=True,
+                       ref_audio_pool=[{"gender": "male", "age_band": "young",
+                                        "timbre": "低沉威严，冷静克制"}]))
+        db.add(Speaker(project_id=pid, label="轻浮男", role_name="B", is_primary=True,
+                       ref_audio_pool=[{"gender": "male", "age_band": "young",
+                                        "timbre": "轻浮冷漠的年轻男声"}]))
+        db.add(VoiceAsset(name="va_male_young", tags=["male", "young"],
+                          ref_audio_r2_key="/voices/young.wav",
+                          tts_params={"desc": "热血 激情 阳光 年轻"}))
+        db.add(VoiceAsset(name="va_male_mature", tags=["male", "young"],
+                          ref_audio_r2_key="/voices/mature.wav",
+                          tts_params={"desc": "低沉 威严 冷静 成熟"}))
+        db.commit()
+        spks = {s.label: s for s in db.query(Speaker).filter_by(project_id=pid).all()}
+        v1 = assign_voice(db, p, spks["冷面男"])
+        v2 = assign_voice(db, p, spks["轻浮男"])
+        assert v1["ref_audio"] == "/voices/mature.wav", v1
+        assert v2["ref_audio"] == "/voices/young.wav", v2
+    finally:
+        db.close()

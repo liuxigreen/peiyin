@@ -27,14 +27,24 @@ def assign_voice(db: Session, project: Project, speaker: Speaker | None) -> dict
         out["ref_audio"] = cluster_ref
         out["engine"] = meta.get("engine")
 
-    # L2：voice_assets 按标签匹配（gender/age_band/timbre 命中数最高者）
-    tags = {t for t in (meta.get("gender"), meta.get("age_band"), meta.get("timbre"))
+    # L2：voice_assets 匹配。评分 = 标签命中×2 + 音色描述关键词命中
+    # （同性别同年龄段的多个角色靠 C0 timbre 描述区分声线，如"低沉威严"vs"轻浮冷漠"）
+    tags = {t for t in (meta.get("gender"), meta.get("age_band"))
             if t and t not in ("unknown", "")}
-    if tags and (out["ref_audio"] is None or out["engine"] is None):
+    timbre = meta.get("timbre") or ""
+    if (tags or timbre) and (out["ref_audio"] is None or out["engine"] is None):
+        def _kw_hits(desc: str) -> int:
+            if not timbre or not desc:
+                return 0
+            grams = {desc[i:i + 2] for i in range(len(desc) - 1)}
+            return sum(1 for g in grams if len(g) >= 2 and g in timbre)
         best: tuple[int, VoiceAsset] | None = None
         for a in db.query(VoiceAsset).all():
-            score = len(set(a.tags or []) & tags)
-            if score and (best is None or score > best[0]):
+            atags = set(a.tags or [])
+            score = 2 * len(atags & tags) + _kw_hits((a.tts_params or {}).get("desc", ""))
+            if not atags & tags and not _kw_hits((a.tts_params or {}).get("desc", "")):
+                continue
+            if best is None or score > best[0]:
                 best = (score, a)
         if best:
             a = best[1]
