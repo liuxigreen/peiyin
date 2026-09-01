@@ -337,7 +337,9 @@ def tts_requeue(pid: str, body: dict, db: Session = Depends(get_db)):
         q = q.filter(PipelineTask.task_key.like(f"TTS-B/{body['scene']}-%"))
     n = 0
     for t in q.all():
-        if (t.output_paths or {}).get("artifacts"):
+        # 旧代码完成的任务 output_paths 可能是列表（outputs直存），统一按dict读
+        outs = t.output_paths if isinstance(t.output_paths, dict) else {}
+        if outs.get("artifacts"):
             continue
         t.status = "pending"; t.claimed_by = None; t.lease_until = None
         n += 1
