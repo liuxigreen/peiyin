@@ -17,11 +17,23 @@ def _secret_ok(x_node_secret: str) -> bool:
     return secrets.compare_digest(x_node_secret, expected)
 
 @router.post("/register")
-def register(body: dict, x_node_secret: str = Header(default="")):
+def register(body: dict, x_node_secret: str = Header(default=""),
+             db: Session = Depends(get_db)):
     if not _secret_ok(x_node_secret):
         raise HTTPException(403, "bad node secret")
     node_token = "gn_" + secrets.token_urlsafe(24)
     h = hashlib.sha256(node_token.encode()).hexdigest()
+    # v1.4：register即建档（原来只发token，行由_auth_node兜底建——节点名/GPU型号
+    # 全丢成dev-node-xxxx）。同名旧行置offline，token轮换后旧心跳行不再堆积。
+    name = body.get("name") or "unnamed-node"
+    for old in db.query(m.GpuNode).filter_by(name=name).all():
+        old.online = False
+    db.add(m.GpuNode(name=name, gpu_model=body.get("gpu_model"),
+                     vram_gb=body.get("vram_gb"),
+                     capabilities=body.get("capabilities") or [],
+                     online=True, token_hash=h,
+                     last_heartbeat=datetime.now(timezone.utc)))
+    db.commit()
     return {"node_token": node_token,
             "note": "保存好token，之后所有请求带 Authorization: Bearer <token>"}
 

@@ -7,14 +7,33 @@ NODE_SECRET = os.getenv("NODE_SHARED_SECRET", "dev-node-secret")
 POLL_IDLE = int(os.getenv("POLL_IDLE", "5"))
 
 state = {"token": os.getenv("NODE_TOKEN", "dev-node-token")}
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "workdir", "node_token.txt")
 
 def register():
+    """token持久化：重启复用已存token（心跳验证），失效才重新register——
+    原实现每次重启换新token，控制面节点行无限堆积。"""
+    if os.path.exists(TOKEN_FILE):
+        tok = open(TOKEN_FILE).read().strip()
+        if tok:
+            try:
+                httpx.post(f"{CONTROL}/api/nodes/heartbeat",
+                           headers={"Authorization": f"Bearer {tok}"},
+                           timeout=10).raise_for_status()
+                state["token"] = tok
+                print("[node] token reused")
+                return
+            except Exception:
+                pass          # token失效/网络抖动→走重新register
     r = httpx.post(f"{CONTROL}/api/nodes/register",
-                   headers={"x-node-secret": NODE_SECRET},
+                   headers={"x-node-secret": NODE_SHARED_SECRET},
                    json={"name": os.uname().nodename, "gpu_model": os.getenv("GPU_MODEL", "?"),
                          "vram_gb": int(os.getenv("GPU_VRAM", "0")), "capabilities": ["tts","asr","sep"]})
     r.raise_for_status()
     state["token"] = r.json()["node_token"]
+    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    with open(TOKEN_FILE, "w") as f:
+        f.write(state["token"])
     print("[node] registered")
 
 def heartbeat_loop():
@@ -105,6 +124,11 @@ def main():
             r = httpx.get(f"{CONTROL}/api/nodes/me/claim",
                           params={"model": os.getenv("PREFERRED_MODEL") or None},
                           headers={"Authorization": f"Bearer {state['token']}"}, timeout=30)
+            if r.status_code == 401:
+                print("[claim] token rejected → re-register")
+                os.path.exists(TOKEN_FILE) and os.remove(TOKEN_FILE)
+                register()
+                continue
             task = (r.json() or {}).get("task")
             if task: dispatch(task)
             else: time.sleep(POLL_IDLE)

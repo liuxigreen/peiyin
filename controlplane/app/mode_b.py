@@ -63,6 +63,86 @@ def tts_clips_mock(slots: list[dict], target_lang: str, out_dir: str) -> list[di
     return clips
 
 
+def fit_clip(src_path: str, dst_dir: str, uid: str,
+             window_ms: int, max_stretch: float = 1.3) -> dict:
+    """T320时长匹配（最小实装）：成片时长 > 窗口×1.15 时 ffmpeg atempo 加速到窗口内
+    （上限 max_stretch，仍超→保留原样标记 over_window，进qc报告人工处理）。
+    返回 {path, final_ms, speed, over_window}。"""
+    info = sf.info(src_path)
+    final_ms = int(info.frames / info.samplerate * 1000)
+    out = {"path": src_path, "final_ms": final_ms, "speed": 1.0, "over_window": False}
+    if window_ms <= 0:
+        return out
+    ratio = final_ms / window_ms
+    if ratio <= 1.15:
+        return out
+    if ratio > max_stretch:
+        out["over_window"] = True
+        return out
+    try:
+        speed = round(min(ratio + 0.02, max_stretch), 3)
+        os.makedirs(dst_dir, exist_ok=True)
+        dst = os.path.join(dst_dir, f"fit_{uid}.wav")
+        subprocess.run([_ffmpeg(), "-y", "-i", src_path, "-filter:a",
+                        f"atempo={speed}", dst],
+                       capture_output=True, timeout=120, check=True)
+        info2 = sf.info(dst)
+        out.update(path=dst, final_ms=int(info2.frames / info2.samplerate * 1000),
+                   speed=speed)
+    except Exception:                                        # noqa: BLE001
+        out["over_window"] = True
+    return out
+
+
+def build_package_from_clips(project: dict, rows: list[dict], out_dir: str) -> str:
+    """B6真TTS交付包（区别于mock的build_package）：
+    rows=[{uid,seq,start_ms,end_ms,text,audio_path,final_ms,speed,engine,
+           over_window,over_limit}]。
+    字幕时间码=原slot窗口（字幕跟源时间轴走）；音频按 uid 命名；
+    无产物句进qc missing清单。返回zip路径。"""
+    os.makedirs(out_dir, exist_ok=True)
+    from app.render import write_srt, write_ass
+    sub_entries, manifest, missing, over_win, over_limit = [], [], [], [], []
+    for r in rows:
+        if not r.get("audio_path"):
+            missing.append({"uid": r["uid"], "seq": r["seq"]})
+            continue
+        if r.get("over_window"):
+            over_win.append(r["uid"])
+        if r.get("over_limit"):
+            over_limit.append(r["uid"])
+        sub_entries.append({"start_ms": r["start_ms"], "end_ms": r["end_ms"],
+                            "text": r["text"]})
+        manifest.append({"uid": r["uid"], "seq": r["seq"],
+                         "start_ms": r["start_ms"],
+                         "window_ms": (r["end_ms"] or 0) - (r["start_ms"] or 0),
+                         "final_ms": r.get("final_ms"), "speed": r.get("speed", 1.0),
+                         "engine": r.get("engine", ""),
+                         "over_window": bool(r.get("over_window")),
+                         "text": r["text"]})
+    qc = {"clips": len(manifest), "missing": missing, "over_window": over_win,
+          "over_limit": over_limit}
+    srt = write_srt(sub_entries,
+                    os.path.join(out_dir, f"subtitles.{project['target_lang']}.srt"))
+    ass = write_ass(sub_entries,
+                    os.path.join(out_dir, f"subtitles.{project['target_lang']}.ass"))
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"project": project["name"], "target_lang": project["target_lang"],
+                   "clips": manifest}, f, ensure_ascii=False, indent=1)
+    with open(os.path.join(out_dir, "qc_report.json"), "w", encoding="utf-8") as f:
+        json.dump(qc, f, ensure_ascii=False, indent=1)
+    zip_path = os.path.join(out_dir, f"dubbing_package_{project['id'][:8]}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(srt, os.path.basename(srt))
+        z.write(ass, os.path.basename(ass))
+        z.write(os.path.join(out_dir, "manifest.json"), "manifest.json")
+        z.write(os.path.join(out_dir, "qc_report.json"), "qc_report.json")
+        for r in rows:
+            if r.get("audio_path"):
+                z.write(r["audio_path"], f"audio/{r['seq']:04d}_{r['uid']}.wav")
+    return zip_path
+
+
 def build_package(project: dict, entries: list[dict], translations: dict,
                   fitted: list[dict], out_dir: str, qc: dict) -> str:
     """B6：交付包。translations={uid: text}, fitted=[{seq_index,path,final_ms,speed}]"""

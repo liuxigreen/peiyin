@@ -265,3 +265,107 @@ def test_save_translation_hotfix_versions(tmp_path):
         assert len(human) == 2 and all(t.is_approved for t in human)
     finally:
         db.close()
+
+
+# ── wave2：register建档（节点名/GPU型号不再丢失）─────────────
+def test_register_creates_node_row(tmp_path):
+    c = _client(str(tmp_path / "w2.db"))
+    r = c.post("/api/nodes/register",
+               headers={"x-node-secret": "dev-node-secret"},
+               json={"name": "rtx3060", "gpu_model": "RTX 3060", "vram_gb": 12,
+                     "capabilities": ["tts"]})
+    assert r.status_code == 200, r.text
+    nodes = c.get("/api/nodes").json()
+    row = [n for n in nodes if n["name"] == "rtx3060"]
+    assert row and row[0]["gpu_model"] == "RTX 3060" and row[0]["online"], nodes
+    # 同名重复注册：新行online，旧行置offline（不堆积）
+    c.post("/api/nodes/register", headers={"x-node-secret": "dev-node-secret"},
+           json={"name": "rtx3060", "gpu_model": "RTX 3060", "vram_gb": 12})
+    nodes = c.get("/api/nodes").json()
+    rows = [n for n in nodes if n["name"] == "rtx3060"]
+    assert len(rows) == 2 and sum(1 for n in rows if n["online"]) == 1, rows
+
+
+# ── wave2：tts-batch 幂等批量 ───────────────────────────────
+def test_tts_batch_create_and_dedupe(tmp_path):
+    c = _client(str(tmp_path / "w3.db"))
+    pid = _seed_translated(c, "批量剧", scene_size=2)
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-batch",
+               json={"scene": "SC01", "engine": "cosyvoice_api",
+                     "engine_url": "http://127.0.0.1:50000/tts"}).json()
+    assert r["ok"] and r["created"] == 2 and r["no_translation"] == 0, r
+    # 重跑幂等：同hash全跳过
+    r2 = c.post(f"/api/projects/{pid}/mode-b/tts-batch",
+                json={"scene": "SC01", "engine": "cosyvoice_api",
+                      "engine_url": "http://127.0.0.1:50000/tts"}).json()
+    assert r2["created"] == 0 and r2["skipped"] == 2, r2
+    # payload/engine 落库正确
+    from app.db.models import PipelineTask
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        tsks = (db.query(PipelineTask)
+                  .filter_by(project_id=pid, task_type="tts-generate").all())
+        assert len(tsks) == 2 and all(
+            t.output_paths["payload"]["engine"] == "cosyvoice_api" for t in tsks)
+        assert all(t.task_key.startswith("TTS-B/") for t in tsks)
+    finally:
+        db.close()
+
+
+# ── wave2：fit_clip + package-from-clips ────────────────────
+def test_fit_and_package_from_clips(tmp_path):
+    import numpy as np
+    import soundfile as sf
+    c = _client(str(tmp_path / "w4.db"))
+    pid = _seed_translated(c, "交付剧", scene_size=40)
+    utts = c.get(f"/api/projects/{pid}/utterances?lang=en").json()
+    # 造1条已完成clip（短窗口→触发fit），其余句missing
+    storage = tmp_path / "storage"
+    os.environ["MODE_B_STORAGE"] = str(storage)
+    wav = storage / "artifacts" / "x" / "seg.wav"
+    wav.parent.mkdir(parents=True)
+    sr = 16000
+    sf.write(str(wav), (0.3 * np.sin(2 * np.pi * 400 *
+             np.linspace(0, 4.0, sr * 4, endpoint=False))).astype("float32"), sr)
+    from app.db.models import TtsClip, Translation, Utterance
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        u = (db.query(Utterance).filter_by(project_id=pid)
+               .order_by(Utterance.seq_index).first())
+        tr = (db.query(Translation).filter_by(utterance_id=u.id, target_lang="en")
+                .order_by(Translation.version.desc()).first())
+        db.add(TtsClip(utterance_id=u.id, target_lang="en", translation_id=tr.id,
+                       version=tr.version, audio_r2_key=str(wav), duration_ms=4000,
+                       tts_engine="cosyvoice_api", status="completed"))
+        db.commit()
+    finally:
+        db.close()
+    r = c.post(f"/api/projects/{pid}/mode-b/package-from-clips", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["clips"] == 1 and body["missing"] == len(utts) - 1, body
+    import zipfile
+    with zipfile.ZipFile(body["zip"]) as z:
+        names = z.namelist()
+        assert any(n.startswith("audio/") for n in names), names
+        assert "manifest.json" in names and "qc_report.json" in names, names
+        assert any("subtitles.en.srt" in n for n in names), names
+
+
+# ── wave2：fit_clip 单元（超窗加速 / 极端超窗标记）───────────
+def test_fit_clip_stretch_and_flag(tmp_path):
+    import numpy as np
+    import soundfile as sf
+    from app.mode_b import fit_clip
+    sr = 16000
+    long_wav = tmp_path / "long.wav"
+    sf.write(str(long_wav), np.zeros(sr * 5, dtype="float32"), sr)   # 5s 音频
+    r = fit_clip(str(long_wav), str(tmp_path / "fit"), "U1", 4000)   # 窗口4s → ratio1.25
+    assert r["speed"] > 1.0 and not r["over_window"], r
+    assert r["final_ms"] <= 4000 * 1.05, r
+    huge = tmp_path / "huge.wav"
+    sf.write(str(huge), np.zeros(sr * 10, dtype="float32"), sr)      # 10s → ratio2.5
+    r2 = fit_clip(str(huge), str(tmp_path / "fit"), "U2", 4000)
+    assert r2["over_window"] and r2["speed"] == 1.0, r2

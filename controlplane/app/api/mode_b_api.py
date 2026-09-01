@@ -111,6 +111,33 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
             "scenes_translated": len(tr_results)}
 
 
+def _tts_payload(db: Session, p: Project, target_u: Utterance,
+                 latest: Translation, body: dict) -> tuple[dict, Speaker | None]:
+    """单句TTS payload构建（单测端点与批量端点共用）。
+    显式body参数 > speaker档案音色分配(G8) > 默认mock；G7语气参数进payload。"""
+    from ..db.models import Speaker
+    from ..voice_assign import assign_voice
+    spk = None
+    if body.get("speaker_id"):
+        spk = db.get(Speaker, body["speaker_id"])
+    elif body.get("speaker"):
+        spk = (db.query(Speaker)
+                 .filter(Speaker.project_id == p.id,
+                         Speaker.label.in_([body["speaker"]])
+                         | Speaker.role_name.in_([body["speaker"]])).first())
+    voice = assign_voice(db, p, spk) if spk else {}
+    payload = {"text": latest.text, "lang": p.target_lang,
+               "engine": body.get("engine") or voice.get("engine") or "mock",
+               "engine_url": body.get("engine_url") or voice.get("engine_url"),
+               "ref_audio": body.get("ref_audio") or voice.get("ref_audio"),
+               "uid": target_u.uid}
+    for k in ("emotion", "instruct", "rate"):
+        v = body.get(k, voice.get(k))
+        if v is not None:
+            payload[k] = v
+    return payload, spk
+
+
 @router.post("/projects/{pid}/mode-b/tts-task")
 def create_tts_task(pid: str, body: dict, db: Session = Depends(get_db)):
     """创建单句TTS测试任务（GPU节点claim执行）。
@@ -122,9 +149,8 @@ def create_tts_task(pid: str, body: dict, db: Session = Depends(get_db)):
     (gpu_required) → 节点轮询领取 → 完成后节点artifact回传wav（G6），
     output_paths 记录控制面侧产物路径 + tts_clips 落库。"""
     import datetime as _dt
-    from ..db.models import PipelineTask, Speaker
+    from ..db.models import PipelineTask
     from ..translate_executor import is_placeholder
-    from ..voice_assign import assign_voice
     p = db.get(Project, pid)
     if not p:
         raise HTTPException(404)
@@ -140,25 +166,7 @@ def create_tts_task(pid: str, body: dict, db: Session = Depends(get_db)):
                 .order_by(Translation.version.desc()).first())
     if not latest or is_placeholder(latest.text or ""):
         raise HTTPException(400, "target utterance has no valid translation")
-    # G8音色分配：显式body参数 > speaker档案分配 > 默认mock
-    spk = None
-    if body.get("speaker_id"):
-        spk = db.get(Speaker, body["speaker_id"])
-    elif body.get("speaker"):
-        spk = (db.query(Speaker)
-                 .filter(Speaker.project_id == pid,
-                         Speaker.label.in_([body["speaker"]])
-                         | Speaker.role_name.in_([body["speaker"]])).first())
-    voice = assign_voice(db, p, spk) if spk else {}
-    payload = {"text": latest.text, "lang": p.target_lang,
-               "engine": body.get("engine") or voice.get("engine") or "mock",
-               "engine_url": body.get("engine_url") or voice.get("engine_url"),
-               "ref_audio": body.get("ref_audio") or voice.get("ref_audio"),
-               "uid": target_u.uid}
-    for k in ("emotion", "instruct", "rate"):     # G7：语气/情绪参数进payload
-        v = body.get(k, voice.get(k))
-        if v is not None:
-            payload[k] = v
+    payload, _ = _tts_payload(db, p, target_u, latest, body)
     task_key = f"TTS-TEST/{target_u.uid}/{int(_dt.datetime.now().timestamp())}"
     t = PipelineTask(
         project_id=pid, task_key=task_key, task_type="tts-generate",
@@ -176,6 +184,113 @@ def create_tts_task(pid: str, body: dict, db: Session = Depends(get_db)):
                                                          "instruct", "rate")},
             "note": "节点启动 gpunode/entrypoint.py 后自动领取执行；"
                     "产物经 /api/nodes/tasks/{id}/artifact 回传"}
+
+
+@router.post("/projects/{pid}/mode-b/tts-batch")
+def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
+    """批量创建单句TTS任务（白月光整套配音测试主通道）。
+    body: {scene?: 'SC01'（缺省全项目）, limit?: 最多创建N句,
+           engine/engine_url/ref_audio/emotion/instruct/rate?: 同tts-task}
+    幂等：input_hash = uid+译文版本+engine+instruct，已有同hash任务
+    （pending/running/completed）跳过——重跑/补跑安全。"""
+    from ..db.models import PipelineTask
+    from ..translate_executor import is_placeholder
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    utts = (db.query(Utterance).filter_by(project_id=pid)
+              .order_by(Utterance.seq_index).all())
+    scene = body.get("scene")
+    if scene:
+        utts = [u for u in utts if (u.uid or "").startswith(f"{scene}-")]
+    limit = int(body.get("limit") or 0)
+    created = skipped = no_translation = 0
+    import datetime as _dt
+    ts = int(_dt.datetime.now().timestamp())
+    for n, u in enumerate(utts):
+        if limit and created >= limit:
+            break
+        latest = (db.query(Translation)
+                    .filter_by(utterance_id=u.id, target_lang=p.target_lang)
+                    .order_by(Translation.version.desc()).first())
+        if not latest or is_placeholder(latest.text or ""):
+            no_translation += 1
+            continue
+        payload, _ = _tts_payload(db, p, u, latest, body)
+        ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"
+              f"{payload.get('instruct') or ''}:{payload.get('ref_audio') or ''}")
+        dup = (db.query(PipelineTask)
+                 .filter(PipelineTask.project_id == pid,
+                         PipelineTask.input_hash == ih,
+                         PipelineTask.status != "dead").first())
+        if dup:
+            skipped += 1
+            continue
+        db.add(PipelineTask(
+            project_id=pid, task_key=f"TTS-B/{u.uid}/{ts + n}",
+            task_type="tts-generate", resource="gpu", gpu_required=True,
+            weight=1, depends_on=[], input_hash=ih, status="pending",
+            output_paths={"payload": payload}))
+        created += 1
+    db.commit()
+    return {"ok": True, "created": created, "skipped": skipped,
+            "no_translation": no_translation, "scene": scene or "ALL"}
+
+
+@router.post("/projects/{pid}/mode-b/package-from-clips")
+def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
+    """B6真TTS交付包：从 tts_clips（节点artifact回传产物）构建。
+    字幕=原slot时间码；音频 fit（atempo≤1.3，仍超标记over_window）；
+    无产物句进missing。返回zip+下载路径（复用mode-b/download）。"""
+    import os as _os
+    from ..db.models import PipelineTask, TtsClip
+    from ..mode_b import build_package_from_clips, fit_clip
+    from ..translate_executor import is_placeholder
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    storage = _os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+    work = _os.path.join(storage, pid[:8])
+    out_dir = _os.path.join(work, "package")
+    _os.makedirs(out_dir, exist_ok=True)
+    utts = (db.query(Utterance).filter_by(project_id=pid)
+              .order_by(Utterance.seq_index).all())
+    latest: dict[str, Translation] = {}
+    for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
+                 .order_by(Translation.version).all()):
+        if is_placeholder(t.text or ""):
+            continue
+        latest[t.utterance_id] = t
+    clips = {c.utterance_id: c for c in
+             (db.query(TtsClip).join(Utterance, TtsClip.utterance_id == Utterance.id)
+                .filter(Utterance.project_id == pid, TtsClip.status == "completed")
+                .order_by(TtsClip.version.desc()).all())}
+    fit_dir = _os.path.join(work, "fit")
+    rows = []
+    for i, u in enumerate(utts, 1):
+        tr = latest.get(u.id)
+        clip = clips.get(u.id)
+        row = {"uid": u.uid, "seq": i, "start_ms": u.start_ms, "end_ms": u.end_ms,
+               "text": tr.text if tr else "",
+               "over_limit": bool(tr.is_over_limit) if tr else False,
+               "audio_path": None, "final_ms": None, "speed": 1.0, "engine": ""}
+        if clip and clip.audio_r2_key and _os.path.exists(clip.audio_r2_key):
+            window = (u.end_ms or 0) - (u.start_ms or 0)
+            fitted = fit_clip(clip.audio_r2_key, fit_dir, u.uid, window)
+            row.update(audio_path=fitted["path"], final_ms=fitted["final_ms"],
+                       speed=fitted["speed"], engine=clip.tts_engine,
+                       over_window=fitted["over_window"])
+        rows.append(row)
+    if not any(r["audio_path"] for r in rows):
+        raise HTTPException(400, "无已回传的TTS产物（先跑tts-batch并等节点回传）")
+    zip_path = build_package_from_clips(
+        {"id": pid, "name": p.name, "target_lang": p.target_lang},
+        rows, out_dir)
+    n_clips = sum(1 for r in rows if r["audio_path"])
+    return {"ok": True, "zip": zip_path, "clips": n_clips,
+            "missing": len(rows) - n_clips,
+            "over_window": sum(1 for r in rows if r.get("over_window")),
+            "download_url": f"/api/projects/{pid}/mode-b/download"}
 
 
 @router.get("/projects/{pid}/mode-b/package")
