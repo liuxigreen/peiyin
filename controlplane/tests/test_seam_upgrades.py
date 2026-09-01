@@ -593,7 +593,7 @@ def test_bind_speakers_and_voice_payload(tmp_path, monkeypatch):
     r = c.post(f"/api/projects/{pid}/mode-b/tts-task",
                json={"engine": "cosyvoice_api"}).json()
     assert r["ok"], r
-    assert r["voice"]["ref_audio"] is None, r                # b64模式下ref_audio清空
+    assert r["voice"].get("ref_audio") is None, r            # b64模式下ref_audio键不存在
     from app.db.models import PipelineTask
     db = SessionLocal()
     try:
