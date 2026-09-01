@@ -114,7 +114,13 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
 def _tts_payload(db: Session, p: Project, target_u: Utterance,
                  latest: Translation, body: dict) -> tuple[dict, Speaker | None]:
     """单句TTS payload构建（单测端点与批量端点共用）。
-    显式body参数 > speaker档案音色分配(G8) > 默认mock；G7语气参数进payload。"""
+    音色解析优先级：body显式参数 > 台词绑定speaker的角色音色分配(G8) > 默认mock。
+    云端预置音色文件以base64内嵌下发（节点首次落地workdir/refs缓存后复用）；
+    无参考音时C0的timbre描述作instruct（CosyVoice instruct模式仍可改声线）。"""
+    import base64 as _b64
+    import hashlib as _h
+    import os as _os
+    import re as _re
     from ..db.models import Speaker
     from ..voice_assign import assign_voice
     spk = None
@@ -125,17 +131,30 @@ def _tts_payload(db: Session, p: Project, target_u: Utterance,
                  .filter(Speaker.project_id == p.id,
                          Speaker.label.in_([body["speaker"]])
                          | Speaker.role_name.in_([body["speaker"]])).first())
+    elif getattr(target_u, "speaker_id", None):
+        spk = db.get(Speaker, target_u.speaker_id)       # 台词绑定产物
     voice = assign_voice(db, p, spk) if spk else {}
-    import re as _re
     clean = _re.sub(r"<[^>]+>", "", latest.text or "").strip()   # 剥HTML标签(白月光实测：<b>残留进引擎)
     payload = {"text": clean or latest.text, "lang": p.target_lang,
                "engine": body.get("engine") or voice.get("engine") or "mock",
                "engine_url": body.get("engine_url") or voice.get("engine_url"),
-               "ref_audio": body.get("ref_audio") or voice.get("ref_audio"),
                "uid": target_u.uid}
+    ref = body.get("ref_audio") or voice.get("ref_audio")
+    if ref:
+        if _os.path.exists(ref):            # 云端音色文件→内嵌b64下发
+            payload["ref_audio_b64"] = _b64.b64encode(open(ref, "rb").read()).decode()
+            payload["voice_id"] = "v" + _h.md5(ref.encode()).hexdigest()[:10]
+        else:                                # 节点侧路径原样下发
+            payload["ref_audio"] = ref
+    else:
+        payload["ref_audio"] = None
+        pool = (spk.ref_audio_pool or [{}])[0] if spk else {}
+        timbre = (pool or {}).get("timbre") if isinstance(pool, dict) else ""
+        if timbre:
+            payload["instruct"] = f"用{timbre}的音色说"
     for k in ("emotion", "instruct", "rate"):
         v = body.get(k, voice.get(k))
-        if v is not None:
+        if v is not None and k not in payload:
             payload[k] = v
     return payload, spk
 
@@ -228,6 +247,7 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         payload, _ = _tts_payload(db, p, u, latest, body)
         ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"
               f"{payload.get('instruct') or ''}:{payload.get('ref_audio') or ''}:"
+              f"{payload.get('voice_id') or ''}:"
               f"{payload.get('rate') or ''}:{payload.get('emotion') or ''}")
         dup = (db.query(PipelineTask)
                  .filter(PipelineTask.project_id == pid,
@@ -340,6 +360,19 @@ def download_package(pid: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "交付包未生成")
     return FileResponse(os.path.join(pkg, zips[0]), filename=zips[0],
                         media_type="application/zip")
+
+
+@router.post("/projects/{pid}/bind-speakers")
+async def bind_speakers_ep(pid: str, body: dict = None, db: Session = Depends(get_db)):
+    """LLM文本绑定：每句台词→说话角色（utterances.speaker_id）。
+    声纹聚类实装前的绑定通道；幂等（已绑定跳过，force=True覆盖）。"""
+    from ..cast_agent import bind_speakers
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    body = body or {}
+    r = await bind_speakers(db, p, force=bool(body.get("force")))
+    return {"ok": True, **r}
 
 
 @router.get("/projects/{pid}/mode-b/file/{name}")

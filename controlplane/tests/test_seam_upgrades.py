@@ -534,3 +534,72 @@ def test_marker_lines_skipped(tmp_path):
     from app.translate_executor import is_marker
     assert is_marker("【第 1 段】") and is_marker("【Segment 1】")
     assert not is_marker("你竟敢这样对我！")
+
+
+# ── wave4：多角色音色链路（绑定→分配→b64下发）────────────────
+def test_bind_speakers_and_voice_payload(tmp_path, monkeypatch):
+    c = _client(str(tmp_path / "w11.db"))
+    pid = _seed_translated(c, "绑定剧", scene_size=40)
+    from app.db.models import Speaker, Utterance
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        db.add(Speaker(project_id=pid, label="男主", role_name="Hero",
+                       ref_audio_pool=[{"gender": "male", "age_band": "young",
+                                        "timbre": "低沉"}]))
+        db.add(Speaker(project_id=pid, label="女主", role_name="Heroine",
+                       ref_audio_pool=[{"gender": "female", "age_band": "young",
+                                        "timbre": "甜美"}]))
+        db.commit()
+    finally:
+        db.close()
+    # LLM绑定stub：奇数行→男主，偶数行→女主
+    import app.cast_agent as ca
+
+    async def _stub(cfg, system, user):
+        out = []
+        for line in user.splitlines():
+            if "|" in line and line.strip()[0].isdigit():
+                n = line.split("|")[0].strip()
+                out.append(f"{n} | {'男主' if int(n) % 2 else '女主'}")
+        return "\n".join(out)
+
+    monkeypatch.setattr(ca._te, "chat", _stub)
+    import asyncio
+    from app.db.models import Project
+    db = SessionLocal()
+    try:
+        p = db.get(Project, pid)
+        r = asyncio.run(ca.bind_speakers(db, p))
+        assert r["bound"] >= 2, r
+    finally:
+        db.close()
+    # 音色资产就位后：payload带b64+voice_id
+    db = SessionLocal()
+    try:
+        from app.db.models import VoiceAsset
+        import soundfile as sf
+        import numpy as np
+        vp = tmp_path / "v.wav"
+        sf.write(str(vp), np.zeros(1600, dtype="float32"), 16000)
+        db.add(VoiceAsset(name="va_male_young", tags='["male","young"]',
+                          ref_audio_r2_key=str(vp)))
+        db.commit()
+        spk = db.query(Speaker).filter_by(label="男主").first()
+        u1 = db.query(Utterance).filter_by(project_id=pid, speaker_id=spk.id).first()
+        uid = u1.uid
+    finally:
+        db.close()
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-task",
+               json={"engine": "cosyvoice_api"}).json()
+    assert r["ok"], r
+    assert r["voice"]["ref_audio"].endswith("v.wav"), r      # 分配到男主音色
+    from app.db.models import PipelineTask
+    db = SessionLocal()
+    try:
+        t = db.get(PipelineTask, r["task_id"])
+        pay = t.output_paths["payload"]
+        assert pay.get("ref_audio_b64"), pay                 # 云端文件→b64内嵌
+        assert pay.get("voice_id"), pay
+    finally:
+        db.close()

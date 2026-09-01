@@ -161,3 +161,87 @@ async def extract_cast(db: Session, project: Project) -> dict:
             "cast": [{"label": c["label"], "en": _pick(c, "role_name"),
                       "gender": _pick(c, "gender"), "age": _pick(c, "age_band"),
                       "primary": bool(c.get("is_primary"))} for c in characters]}
+
+
+# ── 台词→角色绑定（DESIGN-B v2 Step2的文本版：声纹聚类实装前，
+# 用LLM按上下文给每句台词归属角色，utterances.speaker_id落地后全链吃到"谁在说"）──
+_BIND_SYS = (
+    "你是影视配音导演。给每句台词标注说话角色。角色名单（label，只允许用名单内的label）：\n"
+    "{roster}\n"
+    "依据：台词内容、人物称呼、语气、剧情逻辑。输出行协议 'N | label'（N=台词编号），"
+    "每行一条，全部台词都要标注。绝不输出名单外的label。")
+
+
+def _resolve_label(raw: str, spks: list) -> Speaker | None:
+    """LLM输出的label→speaker：label精确 → role_name → 前后包含匹配。"""
+    raw = (raw or "").strip().strip("【】\"'。.")
+    if not raw:
+        return None
+    for s in spks:
+        if s.label == raw:
+            return s
+    for s in spks:
+        if s.role_name and s.role_name.lower() == raw.lower():
+            return s
+    for s in spks:
+        if raw and (raw in s.label or s.label in raw):
+            return s
+    return None
+
+
+async def bind_speakers(db: Session, project: Project, force: bool = False) -> dict:
+    """按场景批给台词绑定说话角色。幂等：已绑定的行跳过（force=True才覆盖）。"""
+    from .db.models import Utterance as _U
+    utts = (db.query(_U).filter_by(project_id=project.id)
+              .order_by(_U.seq_index).all())
+    spks = (db.query(Speaker).filter_by(project_id=project.id)
+              .order_by(Speaker.is_primary.desc()).all())
+    if not utts or not spks:
+        raise RuntimeError("need utterances and speakers (run extract_cast first)")
+    roster = "\n".join(
+        f"- {s.label}（{s.role_name or ''}，{((s.ref_audio_pool or [{}])[0] or {}).get('gender', 'unknown')}）"
+        for s in spks[:40])
+    provider = load_default_provider(db)
+    fallbacks = load_fallback_providers(db)
+    scenes: dict[str, list] = {}
+    for u in utts:
+        scenes.setdefault((u.uid or "SC01").split("-")[0], []).append(u)
+    bound = already = unbound = 0
+    unmatched_labels: Counter[str] = Counter()
+    for sc, sus in sorted(scenes.items()):
+        todo = [u for u in sus if force or not u.speaker_id]
+        if not todo:
+            continue
+        lines = [f"{n} | {(u.merged_text or u.original_text or '')[:60]}"
+                 for n, u in enumerate(todo, 1)]
+        user = f"场景{sc}的台词：\n" + "\n".join(lines)
+        got = None
+        for cand in [provider] + fallbacks:
+            try:
+                raw = await _te.chat(cand, _BIND_SYS.format(roster=roster), user)
+                got = _te._parse_fixes(raw)          # 复用 'N | x' 行协议解析
+                if got:
+                    break
+            except Exception as e:                   # noqa: BLE001
+                log.warning("bind scene %s provider %s failed: %s", sc, cand["model"], e)
+        if not got:
+            unbound += len(todo)
+            continue
+        for n, u in enumerate(todo, 1):
+            lab = (got.get(n) or "").strip()
+            spk = _resolve_label(lab, spks)
+            if spk is None:
+                if lab:
+                    unmatched_labels[lab] += 1
+                continue
+            u.speaker_id = spk.id
+            bound += 1
+        for u in sus:
+            if not u.speaker_id:
+                already += 0
+        db.commit()
+    already = sum(1 for u in utts if u.speaker_id) - bound
+    return {"bound": bound, "already_bound": max(already, 0),
+            "unbound": unbound, "scenes": len(scenes),
+            "unmatched_labels": dict(unmatched_labels.most_common(8)),
+            "speakers": len(spks)}

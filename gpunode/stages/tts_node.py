@@ -28,6 +28,27 @@ OUTDIR = os.path.join(WORKDIR, "tts_out")
 os.makedirs(OUTDIR, exist_ok=True)
 
 TTS_TIMEOUT = int(os.getenv("TTS_TIMEOUT", "300"))
+REFDIR = os.path.join(WORKDIR, "refs")
+os.makedirs(REFDIR, exist_ok=True)
+
+
+def _resolve_ref(payload: dict) -> str:
+    """参考音解析三级：节点本地路径 → payload内嵌base64（云端生成的预置音色，
+    首次落地 workdir/refs/{voice_id}.wav 后续复用，不再重复传输） → 无参考音。"""
+    ref = payload.get("ref_audio") or ""
+    if ref and os.path.exists(ref):
+        return ref
+    b64 = payload.get("ref_audio_b64")
+    if b64:
+        import base64
+        vid = payload.get("voice_id") or "voice"
+        safe = "".join(c for c in vid if c.isalnum() or c in "-_")[:60] or "voice"
+        path = os.path.join(REFDIR, f"{safe}.wav")
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(b64))
+        return path
+    return ""
 
 
 def _write_placeholder(path: str, seconds: float = 2.0, sr: int = 16000):
@@ -43,7 +64,7 @@ def run_tts(task: dict) -> list[dict]:
     engine = (payload.get("engine") or "mock").lower()
     text = payload.get("text") or ""
     lang = payload.get("lang") or "en"
-    ref = payload.get("ref_audio") or ""
+    ref = _resolve_ref(payload)
     out_path = payload.get("out_path") or os.path.join(
         OUTDIR, f"tts_{int(time.time()*1000)}.wav")
 
