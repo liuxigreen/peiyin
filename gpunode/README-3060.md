@@ -64,3 +64,17 @@ curl -X POST https://dubbing.mulan.dpdns.org/api/projects/<白月光项目id>/mo
 - `claim err` → CONTROL_URL 不可达或 NODE_SHARED_SECRET 不对
 - 任务一直不领 → 控制面 pipeline_tasks 里该任务 status 必须是 pending，且 depends_on 全部 completed
 - CosyVoice 显存不足 → webui 里有 fp16 开关；3060 12G 建议 fp16 + 单并发
+
+## 补充：B方案完整安装清单（2026-09-01 定版）
+
+| 组件 | 必要性 | 安装 |
+|------|--------|------|
+| CosyVoice 3 (TTS) | ✅ 必装 | 见上文第三步 |
+| Demucs (人声分离) | ✅ 必装——去掉原中文人声留伴奏 + 提纯克隆参考音 | `pip install demucs`（上面 requirements 已含） |
+| pyannote (说话人分离) | ⚠️ 选装（建角色音色库用） | `pip install pyannote.audio` + 去 hf.co/settings/tokens 申请 token：`huggingface-cli login` |
+| FunASR (中文识别) | ❌ B方案不装 | 字幕为准；A方案(视频)阶段再装 |
+| ffmpeg | ✅ 必装（Demucs 依赖 + 音频处理） | Windows: `winget install ffmpeg`；Linux: `apt install ffmpeg` |
+
+节点支持的 task_type（控制面可派）：
+- `tts-generate` — TTS合成（cosyvoice_api/fish_api/mock）
+- `separate-vocals` — Demucs 人声/伴奏分离
