@@ -369,3 +369,34 @@ def test_fit_clip_stretch_and_flag(tmp_path):
     sf.write(str(huge), np.zeros(sr * 10, dtype="float32"), sr)      # 10s → ratio2.5
     r2 = fit_clip(str(huge), str(tmp_path / "fit"), "U2", 4000)
     assert r2["over_window"] and r2["speed"] == 1.0, r2
+
+
+# ── wave2.1：tts-requeue 补传通道 ───────────────────────────
+def test_tts_requeue_missing_artifacts(tmp_path):
+    c = _client(str(tmp_path / "w5.db"))
+    pid = _seed_translated(c, "补传剧", scene_size=40)
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-task",
+               json={"engine": "mock"}).json()
+    tid = r["task_id"]
+    H = {"Authorization": "Bearer dev-node-token"}
+    assert c.post(f"/api/nodes/tasks/{tid}/complete", headers=H,
+                  json={"outputs": [{"key": "tts", "path": "/node/a.wav"}]}).status_code == 200
+    # 完成但无artifact → requeue打回pending
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-requeue", json={}).json()
+    assert r["requeued"] == 1, r
+    from app.db.models import PipelineTask
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        assert db.get(PipelineTask, tid).status == "pending"
+    finally:
+        db.close()
+    # 已有artifacts的任务 → requeue跳过
+    import soundfile as sf
+    import numpy as np
+    wav = tmp_path / "a.wav"
+    sf.write(str(wav), np.zeros(1600, dtype="float32"), 16000)
+    assert c.post(f"/api/nodes/tasks/{tid}/artifact", headers=H,
+                  params={"filename": "a.wav"}, content=wav.read_bytes()).status_code == 200
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-requeue", json={}).json()
+    assert r["requeued"] == 0, r

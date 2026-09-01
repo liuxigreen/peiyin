@@ -319,3 +319,27 @@ def download_package(pid: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "交付包未生成")
     return FileResponse(os.path.join(pkg, zips[0]), filename=zips[0],
                         media_type="application/zip")
+
+
+@router.post("/projects/{pid}/mode-b/tts-requeue")
+def tts_requeue(pid: str, body: dict, db: Session = Depends(get_db)):
+    """把已完成但无artifact回传的tts任务打回pending（节点更新回传代码后调用，
+    补传产物）。body: {scene?: 'SC01' 只处理该场景}。已回传过artifacts的跳过。"""
+    from ..db.models import PipelineTask
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    q = (db.query(PipelineTask)
+           .filter(PipelineTask.project_id == pid,
+                   PipelineTask.task_type == "tts-generate",
+                   PipelineTask.status.in_(["completed", "failed", "dead"])))
+    if body.get("scene"):
+        q = q.filter(PipelineTask.task_key.like(f"TTS-B/{body['scene']}-%"))
+    n = 0
+    for t in q.all():
+        if (t.output_paths or {}).get("artifacts"):
+            continue
+        t.status = "pending"; t.claimed_by = None; t.lease_until = None
+        n += 1
+    db.commit()
+    return {"ok": True, "requeued": n}
