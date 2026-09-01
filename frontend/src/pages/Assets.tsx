@@ -10,6 +10,7 @@ const AVATAR_HUES = [222, 262, 160, 28, 200, 320, 90, 0]
 
 export default function Assets() {
   const [tab, setTab] = useState<'voice' | 'term' | 'prompt'>('voice')
+  const [series, setSeries] = useState('全部')
   const [voices, setVoices] = useState<Voice[]>([])
   const [terms, setTerms] = useState<Term[]>([])
   const [prompts, setPrompts] = useState<Prompt[]>([])
@@ -70,7 +71,10 @@ export default function Assets() {
       <button className={'tab' + (tab === 'prompt' ? ' on' : '')} onClick={() => setTab('prompt')}>Prompt模板 ({prompts.length})</button>
     </div>
 
-    {tab === 'voice' && (voices.length === 0
+    {tab === 'voice' && (<div className="page-sub" style={{ marginBottom: 12 }}>
+      音色库全局共享、跨剧复用（设计如此）：预置音色按 性别/年龄段/音色 标签，
+      角色通过「角色→音色分配」按标签自动匹配；主角优先克隆本剧声纹簇（diarize实装后生效）。
+    </div>) && (voices.length === 0
       ? <Empty text="音色库为空——新增预置音色，龙套角色按性别/年龄自动匹配" />
       : <div className="card-grid">
           {voices.map((v, i) => (
@@ -93,21 +97,40 @@ export default function Assets() {
           ))}
         </div>)}
 
-    {tab === 'term' && (terms.length === 0
-      ? <Empty text="术语库为空——C0角色提取会自动写入人名对照，也可手动维护" />
-      : <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
-          <table className="tbl">
-            <thead><tr><th>剧集系列</th><th>中文术语</th><th>语种</th><th>译法</th></tr></thead>
-            <tbody>{terms.map(t => (
-              <tr key={t.series + t.source + t.target_lang}>
-                <td>{t.series || '—'}</td><td>{t.source}</td>
-                <td className="mono dim">{t.target_lang}</td><td>{t.target}</td>
-              </tr>))}
-            </tbody></table>
-        </div>)}
+    {tab === 'term' && (<>
+      <div className="page-sub" style={{ marginBottom: 12 }}>
+        术语按「剧集系列」隔离存储（剧与剧之间互不干扰）；C0角色提取自动写入人名对照，同系列同术语只保留一条译法。
+      </div>
+      {(() => {
+        const all = Array.from(new Set(terms.map(t => t.series || '（未分类）')))
+        const shown = series === '全部' ? terms : terms.filter(t => (t.series || '（未分类）') === series)
+        return (<>
+          <div className="filters">
+            {['全部', ...all].map(se => (
+              <button key={se} className={series === se ? 'on' : ''} onClick={() => setSeries(se)}>{se}</button>
+            ))}
+          </div>
+          {shown.length === 0
+            ? <Empty text="该剧集还没有术语——C0角色提取后自动生成" />
+            : <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+                <table className="tbl">
+                  <thead><tr><th>剧集系列</th><th>中文术语</th><th>语种</th><th>译法</th></tr></thead>
+                  <tbody>{shown.map(t => (
+                    <tr key={t.series + t.source + t.target_lang}>
+                      <td>{t.series || '—'}</td><td>{t.source}</td>
+                      <td className="mono dim">{t.target_lang}</td><td>{t.target}</td>
+                    </tr>))}
+                  </tbody></table>
+              </div>}
+        </>)
+      })()}
+    </>)}
 
-    {tab === 'prompt' && (prompts.length === 0
-      ? <Empty text="Prompt模板为空——当前使用内置模板，可在翻译服务商配置中扩展" />
+    {tab === 'prompt' && (<div className="page-sub" style={{ marginBottom: 12 }}>
+      Prompt模板 = 翻译五步链的提示词覆盖入口（按语种/剧型各存一套，替代内置的 R1直译/R2意译/R3终检提示词）。
+      当前链路跑内置提示词，此表留作按剧调优与 A/B 效果分对比。
+    </div>) && (prompts.length === 0
+      ? <Empty text="暂无自定义模板——当前使用链路内置提示词（效果已实测）" />
       : <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
           <table className="tbl">
             <thead><tr><th>模板名</th><th>语种</th><th>版本</th><th>效果分</th><th></th></tr></thead>

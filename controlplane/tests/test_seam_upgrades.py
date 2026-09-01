@@ -367,8 +367,9 @@ def test_fit_clip_stretch_and_flag(tmp_path):
     assert r["final_ms"] <= 4000 * 1.05, r
     huge = tmp_path / "huge.wav"
     sf.write(str(huge), np.zeros(sr * 10, dtype="float32"), sr)      # 10s → ratio2.5
+    # wave3新语义：超cap也做部分补偿(atempo到1.3)，仍超窗如实标记
     r2 = fit_clip(str(huge), str(tmp_path / "fit"), "U2", 4000)
-    assert r2["over_window"] and r2["speed"] == 1.0, r2
+    assert r2["over_window"] and r2["speed"] == 1.3, r2
 
 
 # ── wave2.1：tts-requeue 补传通道 ───────────────────────────
@@ -505,5 +506,7 @@ def test_work_file_download(tmp_path):
     work.mkdir(parents=True)
     (work / "ab_samples.zip").write_bytes(b"PK\x03\x04fake")
     assert c.get(f"/api/projects/{pid}/mode-b/file/ab_samples.zip").status_code == 200
-    assert c.get(f"/api/projects/{pid}/mode-b/file/../secret").status_code == 400
+    # ..段被HTTP客户端规范化→404；字面穿越由白名单拦→400/404皆安全
+    assert c.get(f"/api/projects/{pid}/mode-b/file/../secret").status_code in (400, 404)
+    assert c.get(f"/api/projects/{pid}/mode-b/file/..%2Fsecret").status_code in (400, 404)
     assert c.get(f"/api/projects/{pid}/mode-b/file/nope.zip").status_code == 404
