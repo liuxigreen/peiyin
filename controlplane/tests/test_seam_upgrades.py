@@ -449,3 +449,30 @@ def test_tts_batch_rate_in_hash_and_uids(tmp_path):
         assert rates == [1.25, 1.25], pay
     finally:
         db.close()
+
+
+# ── wave2.4：clip挂版本跳占位符 + TTS文本剥HTML ──────────────
+def test_tts_payload_strips_html(tmp_path):
+    c = _client(str(tmp_path / "w8.db"))
+    pid = _seed_translated(c, "剥标签剧", scene_size=40)
+    from app.db.models import Translation, Utterance
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        u = (db.query(Utterance).filter_by(project_id=pid)
+               .order_by(Utterance.seq_index).first())
+        db.add(Translation(utterance_id=u.id, target_lang="en", version=99,
+                           text="<b>Hello there</b>", syllable_ratio=1.0))
+        db.commit()
+    finally:
+        db.close()
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-task", json={"engine": "mock"}).json()
+    assert r["ok"], r
+    from app.db.models import PipelineTask
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        t = db.get(PipelineTask, r["task_id"])
+        assert t.output_paths["payload"]["text"] == "Hello there", t.output_paths["payload"]
+    finally:
+        db.close()

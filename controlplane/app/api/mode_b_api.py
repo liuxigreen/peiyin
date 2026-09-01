@@ -126,7 +126,9 @@ def _tts_payload(db: Session, p: Project, target_u: Utterance,
                          Speaker.label.in_([body["speaker"]])
                          | Speaker.role_name.in_([body["speaker"]])).first())
     voice = assign_voice(db, p, spk) if spk else {}
-    payload = {"text": latest.text, "lang": p.target_lang,
+    import re as _re
+    clean = _re.sub(r"<[^>]+>", "", latest.text or "").strip()   # 剥HTML标签(白月光实测：<b>残留进引擎)
+    payload = {"text": clean or latest.text, "lang": p.target_lang,
                "engine": body.get("engine") or voice.get("engine") or "mock",
                "engine_url": body.get("engine_url") or voice.get("engine_url"),
                "ref_audio": body.get("ref_audio") or voice.get("ref_audio"),

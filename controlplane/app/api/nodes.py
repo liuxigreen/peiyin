@@ -201,10 +201,18 @@ def _upsert_tts_clip(db: Session, t: "m.PipelineTask", path: str) -> dict | None
     u = db.query(m.Utterance).filter_by(project_id=t.project_id, uid=uid_).first()
     if not u:
         return None
-    tr = (db.query(m.Translation)
-            .filter_by(utterance_id=u.id, target_lang=payload.get("lang") or "en")
-            .order_by(m.Translation.version.desc()).first())
-    if not tr:
+    # 取最新"非占位符"译文（白月光实测教训：历史bug遗留的[MISSING n]行
+    # 挂在最新版本上，会把正确音频的clip关联到垃圾文本，交付包manifest错乱）
+    from ..translate_executor import is_placeholder as _is_ph
+    tr = None
+    for cand in (db.query(m.Translation)
+                   .filter_by(utterance_id=u.id,
+                              target_lang=payload.get("lang") or "en")
+                   .order_by(m.Translation.version.desc()).all()):
+        if not _is_ph(cand.text or ""):
+            tr = cand
+            break
+    if tr is None:
         return None
     dur_ms = 0
     try:
