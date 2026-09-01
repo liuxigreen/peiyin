@@ -287,6 +287,11 @@ def build_ctx_pack(db: Session, project: Project, utts: list[Utterance]) -> dict
                .filter(GlossaryTerm.target_lang == project.target_lang).all())
     spk_ids = {u.speaker_id for u in utts if u.speaker_id}
     spks = db.query(Speaker).filter(Speaker.id.in_(spk_ids)).all() if spk_ids else []
+    # 未分配说话人时，把提取出的主要角色卡喂给模型（翻译一致性锚）
+    if not spks:
+        spks = (db.query(Speaker).filter_by(project_id=project.id)
+                  .order_by(Speaker.is_primary.desc(), Speaker.utterance_count.desc())
+                  .limit(8).all())
     tpl = (db.query(PromptTemplate)
              .filter_by(target_lang=project.target_lang, is_default=True).first())
     return {
@@ -311,11 +316,15 @@ def _lang_rule(lang: str) -> str:
 
 _R1_SYS = ("你是影视字幕直译员。逐行翻译编号台词，保持行号格式 'N | 译文'。"
            "直译即可，忠实原文，术语表里的词必须用指定译法。")
-_R2_SYS = ("你是影视配音译者。基于第一轮直译做意译：口语自然、符合角色人设、"
-           "符合配音时长约束（尽量精炼）。保持行号格式 'N | 译文'。术语表译法不可更改。")
-_RV_SYS = ("你是译配终审。检查台词清单：角色名/术语前后一致、风格统一、无漏译。"
-           "只输出需要修改的行，格式 'N | 修正译文'；无修改的行不要输出。"
+_R2_SYS = ("你是海外短剧本地化配音译者。基于第一轮直译做意译："
+           "目标受众为北美英语观众；剧型为都市情感短剧，强冲突快节奏；"
+           "语域为现代口语，避免书面腔与过度解释；"
+           "俗语/成语必须译成英文观众秒懂的等效表达。"
+           "符合角色人设与配音时长约束（尽量精炼）。保持行号格式 'N | 译文'。"
            "术语表译法不可更改。")
+_RV_SYS = ("你是译配终审。检查台词清单：角色名/术语前后一致、风格统一、无漏译、"
+           "口语自然符合北美观众语感。只输出需要修改的行，格式 'N | 修正译文'；"
+           "无修改的行不要输出。术语表译法不可更改。")
 _COMP_SYS = ("你是配音字幕压缩员。把每行译文压缩到目标音节数内：保持原意、人名与语气，"
              "能删则删。保持行号格式 'N | 译文'。术语表译法不可更改。")
 

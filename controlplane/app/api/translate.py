@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from ..db.models import (PipelineTask, Project, Segment, Translation,
                          TranslationProvider, Utterance)
 from ..db.session import get_db
+from ..cast_agent import extract_cast
 from ..translate_executor import (execute_translate_task,
                                   load_default_provider,
                                   run_translate_scene)
@@ -88,6 +89,19 @@ def seed_srt(pid: str, body: dict, db: Session = Depends(get_db)):
     n, scenes = _seed_utterances(db, p, body.get("srt", ""),
                                  int(body.get("scene_size", 40)))
     return {"ok": True, "utterances": n, "scenes": scenes}
+
+
+@router.post("/projects/{pid}/extract-cast")
+async def extract_cast_api(pid: str, db: Session = Depends(get_db)):
+    """C0角色提取Agent：LLM扫全剧台词→角色档案(speakers) + 中英人名术语表(glossary)。
+    幂等可重跑；翻译链自动吃到角色卡与人名表。"""
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404, "project not found")
+    if not db.query(Utterance).filter_by(project_id=pid).first():
+        raise HTTPException(400, "no utterances; POST seed-srt first")
+    info = await extract_cast(db, p)
+    return {"ok": True, **info}
 
 
 @router.get("/projects/{pid}/translate-plan")
