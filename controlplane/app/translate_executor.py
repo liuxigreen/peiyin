@@ -121,6 +121,15 @@ def _is_ph(s: str) -> bool:
     return bool(_PLACEHOLDER_RE.match(s or ""))
 
 
+_MARKER_RE = re.compile(r"^\s*【[^】]*】\s*$")
+
+
+def is_marker(text: str) -> bool:
+    """SRT场景标记行判定（如『【第 1 段】』）：结构性噪音，非台词——
+    白月光实测：60条标记行被当台词翻译+配音+进字幕。"""
+    return bool(_MARKER_RE.match(text or ""))
+
+
 def is_placeholder(text: str) -> bool:
     """占位符/拒绝残留判定（历史bug落库的垃圾行；下游取数一律视同不存在）。"""
     return _is_ph(text)

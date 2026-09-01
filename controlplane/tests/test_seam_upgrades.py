@@ -510,3 +510,27 @@ def test_work_file_download(tmp_path):
     assert c.get(f"/api/projects/{pid}/mode-b/file/../secret").status_code in (400, 404)
     assert c.get(f"/api/projects/{pid}/mode-b/file/..%2Fsecret").status_code in (400, 404)
     assert c.get(f"/api/projects/{pid}/mode-b/file/nope.zip").status_code == 404
+
+
+# ── wave3.1：场景标记行不进TTS/交付包 ────────────────────────
+def test_marker_lines_skipped(tmp_path):
+    c = _client(str(tmp_path / "w10.db"))
+    pid = _seed_translated(c, "标记剧", scene_size=40)
+    from app.db.models import Translation, Utterance
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        u = (db.query(Utterance).filter_by(project_id=pid)
+               .order_by(Utterance.seq_index).first())
+        u.original_text = "【第 1 段】"
+        db.add(Translation(utterance_id=u.id, target_lang="en", version=9,
+                           text="【Segment 1】", syllable_ratio=1.0))
+        db.commit()
+    finally:
+        db.close()
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-batch",
+               json={"engine": "mock"}).json()
+    assert r["markers_skipped"] >= 1, r
+    from app.translate_executor import is_marker
+    assert is_marker("【第 1 段】") and is_marker("【Segment 1】")
+    assert not is_marker("你竟敢这样对我！")

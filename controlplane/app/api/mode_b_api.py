@@ -196,7 +196,7 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
     幂等：input_hash = uid+译文版本+engine+instruct，已有同hash任务
     （pending/running/completed）跳过——重跑/补跑安全。"""
     from ..db.models import PipelineTask
-    from ..translate_executor import is_placeholder
+    from ..translate_executor import is_placeholder, is_marker
     p = db.get(Project, pid)
     if not p:
         raise HTTPException(404)
@@ -209,7 +209,7 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         want = set(body["uids"])
         utts = [u for u in utts if u.uid in want]
     limit = int(body.get("limit") or 0)
-    created = skipped = no_translation = 0
+    created = skipped = no_translation = markers = 0
     import datetime as _dt
     import uuid as _uuid
     ts = int(_dt.datetime.now().timestamp())
@@ -221,6 +221,9 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
                     .order_by(Translation.version.desc()).first())
         if not latest or is_placeholder(latest.text or ""):
             no_translation += 1
+            continue
+        if is_marker(latest.text) or is_marker(u.merged_text or u.original_text):
+            markers += 1
             continue
         payload, _ = _tts_payload(db, p, u, latest, body)
         ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"
@@ -241,7 +244,8 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         created += 1
     db.commit()
     return {"ok": True, "created": created, "skipped": skipped,
-            "no_translation": no_translation, "scene": scene or "ALL"}
+            "no_translation": no_translation, "markers_skipped": markers,
+            "scene": scene or "ALL"}
 
 
 @router.post("/projects/{pid}/mode-b/package-from-clips")
@@ -274,8 +278,13 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
                 .order_by(TtsClip.version.desc()).all())}
     fit_dir = _os.path.join(work, "fit")
     import re as _re
+    from ..translate_executor import is_marker
     rows = []
+    n_markers = 0
     for i, u in enumerate(utts, 1):
+        if is_marker(u.merged_text or u.original_text):
+            n_markers += 1
+            continue                      # 场景标记行不进字幕/配音/manifest
         tr = latest.get(u.id)
         clip = clips.get(u.id)
         _txt = _re.sub(r"<[^>]+>", "", tr.text or "").strip() if tr else ""
@@ -300,6 +309,7 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
     n_clips = sum(1 for r in rows if r["audio_path"])
     return {"ok": True, "zip": zip_path, "clips": n_clips,
             "missing": len(rows) - n_clips,
+            "markers_skipped": n_markers,
             "over_window": sum(1 for r in rows if r.get("over_window")),
             "download_url": f"/api/projects/{pid}/mode-b/download"}
 
