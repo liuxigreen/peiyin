@@ -329,10 +329,13 @@ def tts_requeue(pid: str, body: dict, db: Session = Depends(get_db)):
     p = db.get(Project, pid)
     if not p:
         raise HTTPException(404)
+    statuses = ["completed", "failed"]
+    if body.get("include_dead"):
+        statuses.append("dead")       # dead默认跳过：冻结队列/永久失败由tts-batch复活
     q = (db.query(PipelineTask)
            .filter(PipelineTask.project_id == pid,
                    PipelineTask.task_type == "tts-generate",
-                   PipelineTask.status.in_(["completed", "failed", "dead"])))
+                   PipelineTask.status.in_(statuses)))
     if body.get("scene"):
         q = q.filter(PipelineTask.task_key.like(f"TTS-B/{body['scene']}-%"))
     n = 0

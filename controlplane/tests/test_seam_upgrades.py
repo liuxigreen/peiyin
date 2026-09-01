@@ -400,3 +400,25 @@ def test_tts_requeue_missing_artifacts(tmp_path):
                   params={"filename": "a.wav"}, content=wav.read_bytes()).status_code == 200
     r = c.post(f"/api/projects/{pid}/mode-b/tts-requeue", json={}).json()
     assert r["requeued"] == 0, r
+
+
+# ── wave2.2：requeue默认跳过dead（冻结队列不被误复活）─────────
+def test_tts_requeue_skips_dead_by_default(tmp_path):
+    c = _client(str(tmp_path / "w6.db"))
+    pid = _seed_translated(c, "冻结剧", scene_size=40)
+    H = {"Authorization": "Bearer dev-node-token"}
+    r = c.post(f"/api/projects/{pid}/mode-b/tts-task", json={"engine": "mock"}).json()
+    tid = r["task_id"]
+    assert c.post(f"/api/nodes/tasks/{tid}/complete", headers=H,
+                  json={"outputs": [{"key": "tts", "path": "/node/b.wav"}]}).status_code == 200
+    from app.db.models import PipelineTask
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        db.get(PipelineTask, tid).status = "dead"
+        db.commit()
+    finally:
+        db.close()
+    assert c.post(f"/api/projects/{pid}/mode-b/tts-requeue", json={}).json()["requeued"] == 0
+    assert c.post(f"/api/projects/{pid}/mode-b/tts-requeue",
+                  json={"include_dead": True}).json()["requeued"] == 1
