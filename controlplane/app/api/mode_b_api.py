@@ -273,12 +273,14 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
                 .filter(Utterance.project_id == pid, TtsClip.status == "completed")
                 .order_by(TtsClip.version.desc()).all())}
     fit_dir = _os.path.join(work, "fit")
+    import re as _re
     rows = []
     for i, u in enumerate(utts, 1):
         tr = latest.get(u.id)
         clip = clips.get(u.id)
+        _txt = _re.sub(r"<[^>]+>", "", tr.text or "").strip() if tr else ""
         row = {"uid": u.uid, "seq": i, "start_ms": u.start_ms, "end_ms": u.end_ms,
-               "text": tr.text if tr else "",
+               "text": _txt,
                "over_limit": bool(tr.is_over_limit) if tr else False,
                "audio_path": None, "final_ms": None, "speed": 1.0, "engine": ""}
         if clip and clip.audio_r2_key and _os.path.exists(clip.audio_r2_key):
