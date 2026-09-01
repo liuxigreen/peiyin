@@ -476,3 +476,34 @@ def test_tts_payload_strips_html(tmp_path):
         assert t.output_paths["payload"]["text"] == "Hello there", t.output_paths["payload"]
     finally:
         db.close()
+
+
+# ── wave3：联合语速上限（防听不清）+ 工作文件下载 ────────────
+def test_fit_clip_total_speed_cap(tmp_path):
+    import numpy as np
+    import soundfile as sf
+    from app.mode_b import fit_clip
+    sr = 16000
+    wav = tmp_path / "x.wav"
+    sf.write(str(wav), np.zeros(sr * 5, dtype="float32"), sr)   # 5s，窗口2s → ratio2.5
+    # tts_rate=1.0：atempo顶到1.3 → 联合1.3 ≤1.5 允许
+    r = fit_clip(str(wav), str(tmp_path / "f"), "U1", 2000, tts_rate=1.0)
+    assert r["speed"] == 1.3 and r["over_window"], r      # 2.5/1.3=1.92仍超→如实标记
+    # tts_rate=1.25：headroom=1.2 → atempo只到1.2（联合恰1.5封顶）
+    r2 = fit_clip(str(wav), str(tmp_path / "f"), "U2", 2000, tts_rate=1.25)
+    assert r2["speed"] == 1.2 and r2["over_window"], r2
+    # tts_rate=1.5：headroom=1.0 → 完全不再加速
+    r3 = fit_clip(str(wav), str(tmp_path / "f"), "U3", 2000, tts_rate=1.5)
+    assert r3["speed"] == 1.0 and r3["over_window"], r3
+
+
+def test_work_file_download(tmp_path):
+    os.environ["MODE_B_STORAGE"] = str(tmp_path / "storage")
+    c = _client(str(tmp_path / "w9.db"))
+    pid = _seed_translated(c, "下载剧", scene_size=40)
+    work = tmp_path / "storage" / pid[:8]
+    work.mkdir(parents=True)
+    (work / "ab_samples.zip").write_bytes(b"PK\x03\x04fake")
+    assert c.get(f"/api/projects/{pid}/mode-b/file/ab_samples.zip").status_code == 200
+    assert c.get(f"/api/projects/{pid}/mode-b/file/../secret").status_code == 400
+    assert c.get(f"/api/projects/{pid}/mode-b/file/nope.zip").status_code == 404

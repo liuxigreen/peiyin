@@ -64,31 +64,38 @@ def tts_clips_mock(slots: list[dict], target_lang: str, out_dir: str) -> list[di
 
 
 def fit_clip(src_path: str, dst_dir: str, uid: str,
-             window_ms: int, max_stretch: float = 1.3) -> dict:
-    """T320时长匹配（最小实装）：成片时长 > 窗口×1.15 时 ffmpeg atempo 加速到窗口内
-    （上限 max_stretch，仍超→保留原样标记 over_window，进qc报告人工处理）。
-    返回 {path, final_ms, speed, over_window}。"""
+             window_ms: int, max_stretch: float = 1.3,
+             tts_rate: float = 1.0, max_total_speed: float = 1.5) -> dict:
+    """T320时长匹配：atempo 补偿到窗口内。
+    防听不清保护：合成语速(tts_rate)×atempo 的联合加速上限 max_total_speed（默认1.5）——
+    达到上限仍超窗→部分补偿并标记 over_window（进qc人工/压缩重译），
+    绝不无上限加速把配音变成 chipmunk。返回 {path, final_ms, speed, tts_rate, over_window}。"""
     info = sf.info(src_path)
     final_ms = int(info.frames / info.samplerate * 1000)
-    out = {"path": src_path, "final_ms": final_ms, "speed": 1.0, "over_window": False}
+    out = {"path": src_path, "final_ms": final_ms, "speed": 1.0,
+           "tts_rate": tts_rate, "over_window": False}
     if window_ms <= 0:
         return out
     ratio = final_ms / window_ms
     if ratio <= 1.15:
         return out
-    if ratio > max_stretch:
+    headroom = max_total_speed / max(tts_rate, 0.1)   # 剩余允许的atempo空间
+    cap = min(max_stretch, headroom)
+    if cap <= 1.0:
         out["over_window"] = True
         return out
     try:
-        speed = round(min(ratio + 0.02, max_stretch), 3)
+        speed = round(min(ratio + 0.02, cap), 3)
         os.makedirs(dst_dir, exist_ok=True)
         dst = os.path.join(dst_dir, f"fit_{uid}.wav")
         subprocess.run([_ffmpeg(), "-y", "-i", src_path, "-filter:a",
                         f"atempo={speed}", dst],
                        capture_output=True, timeout=120, check=True)
         info2 = sf.info(dst)
-        out.update(path=dst, final_ms=int(info2.frames / info2.samplerate * 1000),
-                   speed=speed)
+        final2 = int(info2.frames / info2.samplerate * 1000)
+        out.update(path=dst, final_ms=final2, speed=speed)
+        if final2 > window_ms * 1.15:            # 到顶仍超窗：如实标记
+            out["over_window"] = True
     except Exception:                                        # noqa: BLE001
         out["over_window"] = True
     return out
@@ -116,7 +123,10 @@ def build_package_from_clips(project: dict, rows: list[dict], out_dir: str) -> s
         manifest.append({"uid": r["uid"], "seq": r["seq"],
                          "start_ms": r["start_ms"],
                          "window_ms": (r["end_ms"] or 0) - (r["start_ms"] or 0),
-                         "final_ms": r.get("final_ms"), "speed": r.get("speed", 1.0),
+                         "final_ms": r.get("final_ms"),
+                         "speed": r.get("speed", 1.0),
+                         "tts_rate": r.get("tts_rate", 1.0),
+                         "total_speed": round(r.get("speed", 1.0) * r.get("tts_rate", 1.0), 3),
                          "engine": r.get("engine", ""),
                          "over_window": bool(r.get("over_window")),
                          "text": r["text"]})

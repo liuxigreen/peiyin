@@ -232,6 +232,7 @@ def _upsert_tts_clip(db: Session, t: "m.PipelineTask", path: str) -> dict | None
         db.add(row)
     row.audio_r2_key = path          # R2未启用阶段存控制面本地路径
     row.duration_ms = dur_ms
+    row.prosody_rate = float(payload["rate"]) if payload.get("rate") else None
     row.status = "completed"
     return {"clip_id": row.id, "duration_ms": dur_ms, "engine": engine}
 

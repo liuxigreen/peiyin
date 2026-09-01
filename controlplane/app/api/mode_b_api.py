@@ -285,10 +285,12 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
                "audio_path": None, "final_ms": None, "speed": 1.0, "engine": ""}
         if clip and clip.audio_r2_key and _os.path.exists(clip.audio_r2_key):
             window = (u.end_ms or 0) - (u.start_ms or 0)
-            fitted = fit_clip(clip.audio_r2_key, fit_dir, u.uid, window)
+            tts_rate = float(clip.prosody_rate or 1.0)
+            fitted = fit_clip(clip.audio_r2_key, fit_dir, u.uid, window,
+                              tts_rate=tts_rate)
             row.update(audio_path=fitted["path"], final_ms=fitted["final_ms"],
                        speed=fitted["speed"], engine=clip.tts_engine,
-                       over_window=fitted["over_window"])
+                       tts_rate=tts_rate, over_window=fitted["over_window"])
         rows.append(row)
     if not any(r["audio_path"] for r in rows):
         raise HTTPException(400, "无已回传的TTS产物（先跑tts-batch并等节点回传）")
@@ -328,6 +330,22 @@ def download_package(pid: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "交付包未生成")
     return FileResponse(os.path.join(pkg, zips[0]), filename=zips[0],
                         media_type="application/zip")
+
+
+@router.get("/projects/{pid}/mode-b/file/{name}")
+def download_work_file(pid: str, name: str):
+    """下载 MODE_B_STORAGE/{pid8}/ 下的工作文件（A/B试听包等）。
+    文件名白名单防目录穿越。"""
+    import os as _os
+    import re as _re
+    from fastapi.responses import FileResponse
+    if not _re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
+        raise HTTPException(400, "bad filename")
+    storage = _os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+    path = _os.path.join(storage, pid[:8], name)
+    if not _os.path.isfile(path):
+        raise HTTPException(404, "file not found")
+    return FileResponse(path, filename=name)
 
 
 @router.post("/projects/{pid}/mode-b/tts-requeue")
