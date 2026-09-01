@@ -3,6 +3,10 @@
 import os, sys, threading, time, httpx, json
 
 CONTROL = os.getenv("CONTROL_URL", "http://localhost:8500")
+# 持久连接：claim/complete/heartbeat/artifact 全部复用同一条 keep-alive 连接。
+# 节点走代理+CF隧道，每请求新建连接的握手开销实测把吞吐拖到5句/分；
+# 复用后请求开销<1s。读/写超时放大（artifact上传、complete）。
+HTTP = httpx.Client(timeout=httpx.Timeout(connect=15, read=300, write=300, pool=300))
 NODE_SECRET = os.getenv("NODE_SHARED_SECRET", "dev-node-secret")
 POLL_IDLE = int(os.getenv("POLL_IDLE", "5"))
 
@@ -17,7 +21,7 @@ def register():
         tok = open(TOKEN_FILE).read().strip()
         if tok:
             try:
-                httpx.post(f"{CONTROL}/api/nodes/heartbeat",
+                HTTP.post(f"{CONTROL}/api/nodes/heartbeat",
                            headers={"Authorization": f"Bearer {tok}"},
                            timeout=10).raise_for_status()
                 state["token"] = tok
@@ -25,7 +29,7 @@ def register():
                 return
             except Exception:
                 pass          # token失效/网络抖动→走重新register
-    r = httpx.post(f"{CONTROL}/api/nodes/register",
+    r = HTTP.post(f"{CONTROL}/api/nodes/register",
                    headers={"x-node-secret": NODE_SHARED_SECRET},
                    json={"name": os.uname().nodename, "gpu_model": os.getenv("GPU_MODEL", "?"),
                          "vram_gb": int(os.getenv("GPU_VRAM", "0")), "capabilities": ["tts","asr","sep"]})
@@ -39,7 +43,7 @@ def register():
 def heartbeat_loop():
     while True:
         try:
-            httpx.post(f"{CONTROL}/api/nodes/heartbeat",
+            HTTP.post(f"{CONTROL}/api/nodes/heartbeat",
                        headers={"Authorization": f"Bearer {state['token']}"}, timeout=10)
         except Exception as e:
             print("[hb] offline:", e)
@@ -53,7 +57,7 @@ def _task_heartbeat_loop(tid: str, stop: list):
         if stop[0]:
             break
         try:
-            httpx.post(f"{CONTROL}/api/nodes/tasks/{tid}/heartbeat",
+            HTTP.post(f"{CONTROL}/api/nodes/tasks/{tid}/heartbeat",
                        headers={"Authorization": f"Bearer {state['token']}"},
                        timeout=10)
         except Exception as e:
@@ -78,7 +82,7 @@ def upload_artifacts(tid: str, outputs):
                 continue
             with open(p, "rb") as f:
                 data = f.read()
-            r = httpx.post(
+            r = HTTP.post(
                 f"{CONTROL}/api/nodes/tasks/{tid}/artifact",
                 params={"filename": _os.path.basename(p), "key": o.get("key", "")},
                 headers={"Authorization": f"Bearer {state['token']}",
@@ -102,14 +106,14 @@ def dispatch(task: dict):
     try:
         from stages.router import run_task     # G0后实装：按type分发到stages/*
         outputs = run_task(task)
-        httpx.post(f"{CONTROL}/api/nodes/tasks/{tid}/complete",
+        HTTP.post(f"{CONTROL}/api/nodes/tasks/{tid}/complete",
                    headers={"Authorization": f"Bearer {state['token']}"},
                    json={"outputs": outputs})
         print(f"[ok] {ttype} {tid[:8]}")
         upload_artifacts(tid, outputs)         # G6：产物文件回传控制面
     except Exception as e:
         retryable = "OOM" not in str(e).upper()
-        httpx.post(f"{CONTROL}/api/nodes/tasks/{tid}/fail",
+        HTTP.post(f"{CONTROL}/api/nodes/tasks/{tid}/fail",
                    headers={"Authorization": f"Bearer {state['token']}"},
                    json={"error": str(e)[:400], "retryable": retryable})
         print(f"[fail] {ttype} {tid[:8]}: {e}")
@@ -121,7 +125,7 @@ def main():
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     while True:
         try:
-            r = httpx.get(f"{CONTROL}/api/nodes/me/claim",
+            r = HTTP.get(f"{CONTROL}/api/nodes/me/claim",
                           params={"model": os.getenv("PREFERRED_MODEL") or None},
                           headers={"Authorization": f"Bearer {state['token']}"}, timeout=30)
             if r.status_code == 401:
