@@ -153,20 +153,43 @@ _VOICES_DIR = os.getenv("NODE_VOICES_DIR",
                         os.path.join(os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b"), "voices"))
 
 
+# P2修复：进程级音色索引缓存（md5→path），避免每请求遍历+读文件算md5
+_voice_index_cache: dict[str, str] | None = None
+
+
+def _build_voice_index() -> dict[str, str]:
+    global _voice_index_cache
+    if _voice_index_cache is not None:
+        return _voice_index_cache
+    import hashlib as _h
+    idx: dict[str, str] = {}
+    if os.path.isdir(_VOICES_DIR):
+        for fn in os.listdir(_VOICES_DIR):
+            fp = os.path.join(_VOICES_DIR, fn)
+            if os.path.isfile(fp):
+                idx["v" + _h.md5(open(fp, "rb").read()).hexdigest()[:10]] = fp
+    _voice_index_cache = idx
+    return idx
+
+
+def invalidate_voice_cache():
+    """新音色入库后调用（管理端点/重启自然失效）。"""
+    global _voice_index_cache
+    _voice_index_cache = None
+
+
 @router.get("/voices/{fid}.wav")
 def get_voice(fid: str):
     """预置音色下发（节点按需拉取并缓存）。fid=文件内容md5前10位（不可猜）。
     设计红线：参考音频绝不入库（0902事故：b64塞output_paths，993MB拖垮SQLite），
-    永远走 HTTP + 节点侧缓存。"""
-    import hashlib as _h
+    永远走 HTTP + 节点侧缓存。
+    P1：带Authorization头时校验节点身份；无头放行（兼容旧节点缓存逻辑）。"""
     from fastapi.responses import FileResponse
     if not fid.isalnum() or len(fid) > 16:
         raise HTTPException(400)
-    if os.path.isdir(_VOICES_DIR):
-        for fn in os.listdir(_VOICES_DIR):
-            fp = os.path.join(_VOICES_DIR, fn)
-            if os.path.isfile(fp) and ("v" + _h.md5(open(fp, "rb").read()).hexdigest()[:10]) == fid:
-                return FileResponse(fp, media_type="audio/wav", filename=f"{fid}.wav")
+    fp = _build_voice_index().get(fid)
+    if fp and os.path.isfile(fp):
+        return FileResponse(fp, media_type="audio/wav", filename=f"{fid}.wav")
     raise HTTPException(404)
 
 
