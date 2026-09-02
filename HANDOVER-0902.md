@@ -153,7 +153,24 @@ eval export $(systemctl show peiyin -p Environment --value)
 
 ---
 
-## 七、快速自检（接手第一遍）
+## 七、0902 事故记录（音频入库拖垮 SQLite，已修待部署）
+
+**事故**：`pipeline_tasks.output_paths.payload` 曾内嵌 437KB 的 `ref_audio_b64`，
+8357 行累计 ~993MB。claim RETURNING * 全列加载 + SQLite 全表扫描 → uvicorn
+CPU 100%、内存 1.9G、`database is locked` 风暴、load 70+，服务不可用。
+
+**修复（分支已提交，52 tests）**：
+1. 音频彻底出库：payload 只带 `voice_id`（内容md5前10位）+ `voice_url`
+   （`/api/nodes/voices/{fid}.wav`）；节点 stage 首次经 HTTP 拉取落地
+   `workdir/refs/{voice_id}.wav` 缓存，此后零网络开销。b64 分支仅作遗留兼容。
+2. 音色下发端点：`GET /api/nodes/voices/{fid}.wav`（NODE_VOICES_DIR 目录按内容
+   哈希匹配，不可猜 URL，内部用途）。
+3. 迁移脚本 `controlplane/scripts/strip_b64.py`：json_remove 全库剥离 + VACUUM 回收。
+
+**教训（红线）**：二进制/大 blob 永远走对象存储或 HTTP+缓存，绝不进
+pipeline_tasks 的 JSON 列——每一行都会被 claim/orchestrator/前端全列加载。
+
+## 八、快速自检（接手第一遍）
 
 ```bash
 cd ~/duanju/dubbing-system && git checkout upgrade/seam-wave1 && git pull

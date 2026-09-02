@@ -33,17 +33,32 @@ os.makedirs(REFDIR, exist_ok=True)
 
 
 def _resolve_ref(payload: dict) -> str:
-    """参考音解析三级：节点本地路径 → payload内嵌base64（云端生成的预置音色，
-    首次落地 workdir/refs/{voice_id}.wav 后续复用，不再重复传输） → 无参考音。"""
+    """参考音解析：本地缓存 → voice_url HTTP拉取（首选，音频绝不进任务表）
+    → 节点路径 → b64（遗留兼容）。缓存键=voice_id，命中后零网络开销。"""
+    vid = payload.get("voice_id") or ""
+    safe = "".join(c for c in vid if c.isalnum() or c in "-_")[:60]
+    if safe:
+        cached = os.path.join(REFDIR, f"{safe}.wav")
+        if os.path.exists(cached):
+            return cached
+    url = payload.get("voice_url")
+    if url and safe:
+        base = os.getenv("CONTROL_URL", "http://localhost:8500").rstrip("/")
+        import urllib.request as _u
+        try:
+            tmp = cached + ".part"
+            _u.urlretrieve(f"{base}{url}", tmp)
+            os.replace(tmp, cached)
+            return cached
+        except Exception as e:
+            print("[voice] download fail:", e)
     ref = payload.get("ref_audio") or ""
     if ref and os.path.exists(ref):
         return ref
     b64 = payload.get("ref_audio_b64")
     if b64:
         import base64
-        vid = payload.get("voice_id") or "voice"
-        safe = "".join(c for c in vid if c.isalnum() or c in "-_")[:60] or "voice"
-        path = os.path.join(REFDIR, f"{safe}.wav")
+        path = os.path.join(REFDIR, f"{safe or 'voice'}.wav")
         if not os.path.exists(path):
             with open(path, "wb") as f:
                 f.write(base64.b64decode(b64))

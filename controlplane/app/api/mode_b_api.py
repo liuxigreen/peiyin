@@ -117,7 +117,6 @@ def _tts_payload(db: Session, p: Project, target_u: Utterance,
     音色解析优先级：body显式参数 > 台词绑定speaker的角色音色分配(G8) > 默认mock。
     云端预置音色文件以base64内嵌下发（节点首次落地workdir/refs缓存后复用）；
     无参考音时C0的timbre描述作instruct（CosyVoice instruct模式仍可改声线）。"""
-    import base64 as _b64
     import hashlib as _h
     import os as _os
     import re as _re
@@ -141,9 +140,11 @@ def _tts_payload(db: Session, p: Project, target_u: Utterance,
                "uid": target_u.uid}
     ref = body.get("ref_audio") or voice.get("ref_audio")
     if ref:
-        if _os.path.exists(ref):            # 云端音色文件→内嵌b64下发
-            payload["ref_audio_b64"] = _b64.b64encode(open(ref, "rb").read()).decode()
-            payload["voice_id"] = "v" + _h.md5(ref.encode()).hexdigest()[:10]
+        if _os.path.exists(ref):            # 云端音色文件→按内容哈希给ID，节点经HTTP拉取+缓存
+            _data = open(ref, "rb").read()
+            vid = "v" + _h.md5(_data).hexdigest()[:10]
+            payload["voice_id"] = vid
+            payload["voice_url"] = f"/api/nodes/voices/{vid}.wav"
         else:                                # 节点侧路径原样下发
             payload["ref_audio"] = ref
     else:

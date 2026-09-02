@@ -599,8 +599,9 @@ def test_bind_speakers_and_voice_payload(tmp_path, monkeypatch):
     try:
         t = db.get(PipelineTask, r["task_id"])
         pay = t.output_paths["payload"]
-        assert pay.get("ref_audio_b64"), pay                 # 云端文件→b64内嵌
-        assert pay.get("voice_id"), pay
+        assert pay.get("voice_id") and pay.get("voice_url"), pay   # HTTP拉取模式
+        assert "ref_audio_b64" not in pay, pay                     # 音频绝不入库(0902事故)
+        assert pay["voice_url"].startswith("/api/nodes/voices/")
     finally:
         db.close()
 
