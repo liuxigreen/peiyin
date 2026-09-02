@@ -157,7 +157,18 @@ def _tts_payload(db: Session, p: Project, target_u: Utterance,
         v = body.get(k, voice.get(k))
         if v is not None and k not in payload:
             payload[k] = v
+    # 情绪→语气指令（台词级 emotion_label 由绑定/人工标记）：
+    # 无instruct且有情绪标注时，转成CosyVoice instruct_text
+    if payload.get("emotion") and not payload.get("instruct"):
+        zh = _EMOTION_ZH.get(payload["emotion"])
+        if zh:
+            payload["instruct"] = f"用{zh}的语气说这句话"
     return payload, spk
+
+
+_EMOTION_ZH = {"angry": "愤怒", "sad": "悲伤低落", "happy": "开心喜悦",
+               "excited": "兴奋激动", "fearful": "恐惧颤抖", "whisper": "压低声音耳语",
+               "cold": "冷漠疏离", "desperate": "绝望哀求", "tender": "温柔"}
 
 
 @router.post("/projects/{pid}/mode-b/tts-task")
