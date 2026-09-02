@@ -157,7 +157,21 @@ def _tts_payload(db: Session, p: Project, target_u: Utterance,
         v = body.get(k, voice.get(k))
         if v is not None and k not in payload:
             payload[k] = v
+    # 情绪→语气指令（台词级 emotion_label 由绑定/人工标记）：
+    # 无instruct且有情绪标注时，转成CosyVoice instruct_text
+    if payload.get("emotion") and not payload.get("instruct"):
+        zh = _EMOTION_ZH.get(payload["emotion"], payload["emotion"])
+        payload["instruct"] = f"用{zh}的语气说这句话"
     return payload, spk
+
+
+_EMOTION_ZH = {"angry": "愤怒", "sad": "悲伤低落", "happy": "开心喜悦",
+               "excited": "兴奋激动", "fearful": "恐惧颤抖", "whisper": "压低声音耳语",
+               "cold": "冷漠疏离", "desperate": "绝望哀求", "tender": "温柔",
+               "哭腔": "带着哭腔", "暴怒": "暴怒咆哮", "震惊": "震惊难以置信",
+               "慌张": "慌张失措", "谄媚": "谄媚讨好", "悲愤": "悲愤交加",
+               "讽刺": "阴阳怪气地讽刺", "冷笑": "冷笑", "复杂": "情绪复杂",
+               "坚定": "坚定有力"}
 
 
 @router.post("/projects/{pid}/mode-b/tts-task")
@@ -245,11 +259,18 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         if is_marker(latest.text) or is_marker(u.merged_text or u.original_text):
             markers += 1
             continue
+        emo = (getattr(u, "emotion_label", "") or "").strip()
+        if emo and emo != "neutral":
+            # 台词级情绪须在_tts_payload内转换成instruct（节点只认instruct），
+            # 传入body让转换链生效；payload里仍保留emotion标签
+            body = {**body, "emotion": emo}
         payload, _ = _tts_payload(db, p, u, latest, body)
+        if emo and emo != "neutral" and "emotion" not in payload:
+            payload["emotion"] = emo
         ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"
               f"{payload.get('instruct') or ''}:{payload.get('ref_audio') or ''}:"
               f"{payload.get('voice_id') or ''}:"
-              f"{payload.get('rate') or ''}:{payload.get('emotion') or ''}")
+              f"{payload.get('rate') or ''}:{payload.get('emotion') or ''}:{emo or ''}")
         dup = (db.query(PipelineTask)
                  .filter(PipelineTask.project_id == pid,
                          PipelineTask.input_hash == ih,
