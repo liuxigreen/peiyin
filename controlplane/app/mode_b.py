@@ -70,8 +70,13 @@ def fit_clip(src_path: str, dst_dir: str, uid: str,
     防听不清保护：合成语速(tts_rate)×atempo 的联合加速上限 max_total_speed（默认1.5）——
     达到上限仍超窗→部分补偿并标记 over_window（进qc人工/压缩重译），
     绝不无上限加速把配音变成 chipmunk。返回 {path, final_ms, speed, tts_rate, over_window}。"""
-    info = sf.info(src_path)
-    final_ms = int(info.frames / info.samplerate * 1000)
+    try:
+        info = sf.info(src_path)
+        final_ms = int(info.frames / info.samplerate * 1000)
+    except Exception as e:                                   # noqa: BLE001
+        # 坏文件（0字节/截断）：如实标记，不让单句炸掉整包
+        return {"path": src_path, "final_ms": 0, "speed": 1.0,
+                "tts_rate": tts_rate, "over_window": True, "corrupt": str(e)[:80]}
     out = {"path": src_path, "final_ms": final_ms, "speed": 1.0,
            "tts_rate": tts_rate, "over_window": False}
     if window_ms <= 0:
