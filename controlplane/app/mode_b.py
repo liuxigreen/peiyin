@@ -70,8 +70,13 @@ def fit_clip(src_path: str, dst_dir: str, uid: str,
     防听不清保护：合成语速(tts_rate)×atempo 的联合加速上限 max_total_speed（默认1.5）——
     达到上限仍超窗→部分补偿并标记 over_window（进qc人工/压缩重译），
     绝不无上限加速把配音变成 chipmunk。返回 {path, final_ms, speed, tts_rate, over_window}。"""
-    info = sf.info(src_path)
-    final_ms = int(info.frames / info.samplerate * 1000)
+    try:
+        info = sf.info(src_path)
+        final_ms = int(info.frames / info.samplerate * 1000)
+    except Exception as e:                                   # noqa: BLE001
+        # 坏文件（0字节/截断）：如实标记，不让单句炸掉整包
+        return {"path": src_path, "final_ms": 0, "speed": 1.0,
+                "tts_rate": tts_rate, "over_window": True, "corrupt": str(e)[:80]}
     out = {"path": src_path, "final_ms": final_ms, "speed": 1.0,
            "tts_rate": tts_rate, "over_window": False}
     if window_ms <= 0:
@@ -101,7 +106,8 @@ def fit_clip(src_path: str, dst_dir: str, uid: str,
     return out
 
 
-def build_package_from_clips(project: dict, rows: list[dict], out_dir: str) -> str:
+def build_package_from_clips(project: dict, rows: list[dict], out_dir: str,
+                             post: bool = True, me_path: str | None = None) -> str:
     """B6真TTS交付包（区别于mock的build_package）：
     rows=[{uid,seq,start_ms,end_ms,text,audio_path,final_ms,speed,engine,
            over_window,over_limit}]。
@@ -141,12 +147,47 @@ def build_package_from_clips(project: dict, rows: list[dict], out_dir: str) -> s
                    "clips": manifest}, f, ensure_ascii=False, indent=1)
     with open(os.path.join(out_dir, "qc_report.json"), "w", encoding="utf-8") as f:
         json.dump(qc, f, ensure_ascii=False, indent=1)
+    # B7句级后处理：手机扬声器EQ+压缩限幅+边界padding(+说话人切换呼吸声)
+    post_errors, master_path = [], None
+    if post:
+        from app.audio_post import condition_line, make_breath, master_mix
+        aud_dir = os.path.join(out_dir, "audio")
+        os.makedirs(aud_dir, exist_ok=True)
+        breath = make_breath(os.path.join(out_dir, "breath.wav"))
+        kept = [r for r in rows if r.get("audio_path")]
+        for r in kept:
+            try:
+                cond = condition_line(
+                    r["audio_path"],
+                    os.path.join(aud_dir, f"{r['seq']:04d}_{r['uid']}.wav"),
+                    breath=breath if r.get("breath") else None)
+                r["audio_path"] = cond
+            except Exception as e:                               # noqa: BLE001
+                post_errors.append({"uid": r["uid"], "err": str(e)[:120]})
+        if kept:
+            total_ms = max((r.get("end_ms") or 0) for r in kept) + 2000
+            master_path = os.path.join(out_dir, "master_13LUFS.wav")
+            try:
+                mix_info = master_mix(
+                    [{"path": r["audio_path"], "start_ms": r["start_ms"] or 0}
+                     for r in kept],
+                    master_path, total_ms, me_path=me_path, work_dir=out_dir)
+                qc["master_mix"] = {"dur_ms": mix_info["dur_ms"],
+                                    "loudnorm": "I=-13 TP=-1 LRA=6"}
+            except Exception as e:                               # noqa: BLE001
+                post_errors.append({"uid": "MIX", "err": str(e)[:160]})
+                master_path = None
+    qc["post_errors"] = post_errors
+    with open(os.path.join(out_dir, "qc_report.json"), "w", encoding="utf-8") as f:
+        json.dump(qc, f, ensure_ascii=False, indent=1)
     zip_path = os.path.join(out_dir, f"dubbing_package_{project['id'][:8]}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(srt, os.path.basename(srt))
         z.write(ass, os.path.basename(ass))
         z.write(os.path.join(out_dir, "manifest.json"), "manifest.json")
         z.write(os.path.join(out_dir, "qc_report.json"), "qc_report.json")
+        if master_path and os.path.exists(master_path):
+            z.write(master_path, "master_13LUFS.wav")
         for r in rows:
             if r.get("audio_path"):
                 z.write(r["audio_path"], f"audio/{r['seq']:04d}_{r['uid']}.wav")

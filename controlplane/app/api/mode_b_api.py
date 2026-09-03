@@ -314,10 +314,11 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
         if is_placeholder(t.text or ""):
             continue
         latest[t.utterance_id] = t
-    clips = {c.utterance_id: c for c in
-             (db.query(TtsClip).join(Utterance, TtsClip.utterance_id == Utterance.id)
-                .filter(Utterance.project_id == pid, TtsClip.status == "completed")
-                .order_by(TtsClip.version.desc()).all())}
+    clips = {}
+    for c in (db.query(TtsClip).join(Utterance, TtsClip.utterance_id == Utterance.id)
+              .filter(Utterance.project_id == pid, TtsClip.status == "completed")
+              .order_by(TtsClip.version.desc()).all()):
+        clips.setdefault(c.utterance_id, c)   # 首见=最高version，重掷新clip优先
     fit_dir = _os.path.join(work, "fit")
     import re as _re
     from ..translate_executor import is_marker
@@ -330,8 +331,9 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
         tr = latest.get(u.id)
         clip = clips.get(u.id)
         _txt = _re.sub(r"<[^>]+>", "", tr.text or "").strip() if tr else ""
+        breath = bool(rows) and any(r.get("audio_path") for r in rows) and             u.speaker_id and rows[-1].get("speaker_id") and             u.speaker_id != rows[-1].get("speaker_id")
         row = {"uid": u.uid, "seq": i, "start_ms": u.start_ms, "end_ms": u.end_ms,
-               "text": _txt,
+               "text": _txt, "speaker_id": u.speaker_id, "breath": breath,
                "over_limit": bool(tr.is_over_limit) if tr else False,
                "audio_path": None, "final_ms": None, "speed": 1.0, "engine": ""}
         if clip and clip.audio_r2_key and _os.path.exists(clip.audio_r2_key):
@@ -347,7 +349,8 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
         raise HTTPException(400, "无已回传的TTS产物（先跑tts-batch并等节点回传）")
     zip_path = build_package_from_clips(
         {"id": pid, "name": p.name, "target_lang": p.target_lang},
-        rows, out_dir)
+        rows, out_dir, post=body.get("audio_post", True),
+        me_path=body.get("me_path"))
     n_clips = sum(1 for r in rows if r["audio_path"])
     return {"ok": True, "zip": zip_path, "clips": n_clips,
             "missing": len(rows) - n_clips,
@@ -440,3 +443,124 @@ def tts_requeue(pid: str, body: dict, db: Session = Depends(get_db)):
         n += 1
     db.commit()
     return {"ok": True, "requeued": n}
+
+
+
+
+@router.post("/projects/{pid}/mode-b/prosody-qc")
+def prosody_qc_pass(pid: str, body: dict, db: Session = Depends(get_db)):
+    """B7韵律质检门：F0半音std/能量std双指标，平坦句自动重掷
+    （instruct加强等效temperature）。耳语/哭腔跳过F0门。
+    metrics存tts_clips.utmos_score（复用列：现为f0_st_std）。"""
+    import os as _os
+    from ..db.models import PipelineTask, TtsClip
+    import uuid as _uuid
+    from ..prosody_qc import evaluate_wav, boosted_instruct, SKIP_EMOTIONS
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    rows = (db.query(TtsClip, Utterance)
+              .join(Utterance, TtsClip.utterance_id == Utterance.id)
+              .filter(Utterance.project_id == pid,
+                      TtsClip.status == "completed").all())
+    checked = flat = requeued = 0
+    details = []
+    done_tasks = {t.task_key: t for t in
+                  db.query(PipelineTask)
+                    .filter(PipelineTask.project_id == pid,
+                            PipelineTask.task_type == "tts-generate").all()}
+    payload_by_uid = {}
+    for t in done_tasks.values():
+        pl = (t.output_paths or {}).get("payload") or {}
+        if pl.get("uid"):
+            payload_by_uid[pl["uid"]] = pl
+    for clip, u in rows:
+        if not clip.audio_r2_key or not _os.path.exists(clip.audio_r2_key):
+            continue
+        m = evaluate_wav(clip.audio_r2_key)
+        checked += 1
+        clip.utmos_score = m.get("f0_st_std")
+        emo = (getattr(u, "emotion_label", "") or "").strip()
+        is_flat = bool(m.get("flat")) and emo not in SKIP_EMOTIONS
+        details.append({"uid": u.uid, "f0_st_std": m.get("f0_st_std"),
+                        "int_std": m.get("int_std"), "flat": is_flat,
+                        "emotion": emo})
+        if not is_flat:
+            continue
+        payload = payload_by_uid.get(u.uid)
+        if not payload:
+            continue
+        new_pl = dict(payload)
+        new_pl["instruct"] = boosted_instruct(payload.get("instruct"), emo)
+        ih = ("tts:{uid}:{ver}:{eng}:{ins}:{ref}:{vid}:{rate}:{emo}:reroll"
+              .format(uid=u.uid, ver=clip.version, eng=new_pl["engine"],
+                      ins=new_pl.get("instruct") or "",
+                      ref=new_pl.get("ref_audio") or "",
+                      vid=new_pl.get("voice_id") or "",
+                      rate=new_pl.get("rate") or "",
+                      emo=new_pl.get("emotion") or ""))
+        dup = (db.query(PipelineTask)
+                 .filter(PipelineTask.input_hash == ih,
+                         PipelineTask.status != "dead").first())
+        if dup:
+            continue
+        db.add(PipelineTask(
+            project_id=pid,
+            task_key="TTS-B/{}/{}".format(u.uid, _uuid.uuid4().hex[:4]),
+            task_type="tts-generate", resource="gpu", gpu_required=True,
+            weight=1, depends_on=[], input_hash=ih, status="pending",
+            output_paths={"payload": new_pl}))
+        requeued += 1
+    db.commit()
+    return {"ok": True, "checked": checked, "flat": flat,
+            "requeued": requeued, "details": details[:50]}
+
+
+@router.post("/projects/{pid}/mode-b/retranslate-overlimit")
+async def retranslate_overlimit(pid: str, body: dict,
+                                db: Session = Depends(get_db)):
+    """B7音节预算闭环：is_over_limit的最新译文自动压缩重译（version+1）。
+    压缩prompt约束目标音节预算与口语化短语，LLM走默认provider链。"""
+    import uuid as _uuidmod
+    from ..db.models import Translation as Tr
+    from ..translate_executor import (chat, load_default_provider,
+                                      is_placeholder)
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    utts = {u.id: u for u in db.query(Utterance)
+            .filter_by(project_id=pid).all()}
+    latest = {}
+    for t in (db.query(Tr).filter_by(target_lang=p.target_lang)
+              .order_by(Tr.version).all()):
+        latest[t.utterance_id] = t
+    cfg = load_default_provider(db)
+    fixed = failed = 0
+    for uid, t in latest.items():
+        if not t.is_over_limit or is_placeholder(t.text or ""):
+            continue
+        u = utts.get(uid)
+        if not u:
+            continue
+        window_s = max(((u.end_ms or 0) - (u.start_ms or 0)) / 1000, 0.5)
+        budget = max(int(window_s * 3.2), 4)   # ~3.2音节/秒英文可用预算
+        system = ("You compress English dubbing lines. Keep the meaning and "
+                  "the melodramatic tone. Output ONLY the compressed line. "
+                  "Hard limit: at most {} syllables.".format(budget))
+        user = "Original: {}\nCompress to at most {} syllables.".format(
+            t.text, budget)
+        try:
+            out = (await chat(cfg, system, user)).strip()
+        except Exception:                                    # noqa: BLE001
+            failed += 1
+            continue
+        if not out or is_placeholder(out):
+            failed += 1
+            continue
+        db.add(Tr(id=_uuidmod.uuid4().hex, utterance_id=uid,
+                  target_lang=p.target_lang, version=t.version + 1,
+                  text=out, llm_model=(cfg.get("model") or "") + "-compress",
+                  is_over_limit=None))
+        fixed += 1
+    db.commit()
+    return {"ok": True, "fixed": fixed, "failed": failed}
