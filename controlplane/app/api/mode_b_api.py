@@ -81,8 +81,19 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
     slots = audio_slots(audio_path, entries, os.path.join(work, "zh_refs")) if has_audio else []
     # B3 翻译（五步链，live provider；含语种校验兜底）
     scenes = sorted({(u.uid or "SC01").split("-")[0] for u in utts})
+    # 上传翻译直连：已有非占位译文的场景跳过LLM（不烧网关配额）
+    from ..translate_executor import is_placeholder as _is_ph2
+    pre_latest = {}
+    for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
+              .order_by(Translation.version).all()):
+        if not _is_ph2(t.text or ""):
+            pre_latest[t.utterance_id] = t
     tr_results = []
     for sc in scenes:
+        sc_utts = [u for u in utts if (u.uid or "").startswith(sc + "-")]
+        if sc_utts and all(u.id in pre_latest for u in sc_utts):
+            tr_results.append({"scene": sc, "skipped": "already_translated"})
+            continue
         info = await run_translate_scene(db, p, sc)
         tr_results.append(info)
     # 收集最新译文
@@ -564,3 +575,56 @@ async def retranslate_overlimit(pid: str, body: dict,
         fixed += 1
     db.commit()
     return {"ok": True, "fixed": fixed, "failed": failed}
+
+
+@router.post("/projects/{pid}/seed-translation")
+def seed_translation(pid: str, body: dict, db: Session = Depends(get_db)):
+    """B8：已有翻译直连配音。上传翻译字幕（双语SRT或纯译文SRT），
+    按序号对齐utterances落Translation，跳过API翻译。
+    块内多行自动挑拉丁字母占比最高的一行当译文；纯中文行跳过。"""
+    from .translate import _parse_srt
+    from ..db.models import Translation as Tr
+    from ..translate_executor import is_placeholder
+    import uuid as _umod
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    srt = body.get("srt") or ""
+    lang = body.get("lang") or p.target_lang
+    entries = _parse_srt(srt)
+    if not entries:
+        raise HTTPException(400, "no subtitle entries parsed from srt")
+
+    def _pick(text: str) -> str:
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        best, best_score = "", -1.0
+        for ln in lines:
+            letters = sum(1 for ch in ln if ch.isascii() and ch.isalpha())
+            score = letters / max(len(ln), 1)
+            if score > best_score:
+                best, best_score = ln, score
+        return best if best_score >= 0.5 else ""
+
+    utts = (db.query(Utterance).filter_by(project_id=pid)
+              .order_by(Utterance.seq_index).all())
+    matched = skipped_cjk = 0
+    mismatch = abs(len(entries) - len(utts))
+    existing = {t.utterance_id: t for t in
+                db.query(Tr).filter_by(target_lang=lang)
+                  .order_by(Tr.version).all()}
+    for u, e in zip(utts, entries):
+        line = _pick(e["text"])
+        if not line or is_placeholder(line):
+            skipped_cjk += 1
+            continue
+        prev = existing.get(u.id)
+        ver = (prev.version + 1) if prev else 1
+        db.add(Tr(id=_umod.uuid4().hex, utterance_id=u.id, target_lang=lang,
+                  version=ver, text=line, llm_model="uploaded",
+                  is_approved=True))
+        matched += 1
+    db.commit()
+    return {"ok": True, "utterances": len(utts), "entries": len(entries),
+            "matched": matched, "skipped_not_translated": skipped_cjk,
+            "index_mismatch": mismatch,
+            "note": "下次run-mode-b将跳过这些句子的API翻译"}

@@ -142,6 +142,23 @@ def complete(task_id: str, body: dict, authorization: str = Header(default=""),
     t.output_paths = outs
     t.output_hash = body.get("output_hash")
     t.lease_until = None
+    # 0902保险丝：b64/超长blob严禁进JSON列（那次事故：437KB b64音频x8357行
+    # 撑爆SQLite，load 70+）。二进制一律走 /artifact 流式端点。
+    import re as _re
+    _blob = _re.compile(r"[A-Za-z0-9+/=]{2048,}")
+    def _scan(o):
+        if isinstance(o, str):
+            return len(o) > 65536 or o.startswith("data:") or                 (len(o) > 2048 and bool(_blob.fullmatch(o)))
+        if isinstance(o, dict):
+            return any(_scan(v) for v in o.values())
+        if isinstance(o, list):
+            return any(_scan(v) for v in o)
+        return False
+    if _scan(outs) or len(repr(outs)) > 524288:
+        t.status = "running"
+        db.commit()
+        raise HTTPException(413, "outputs contain base64/binary blob; "
+                            "POST it to /artifact instead (0902 red line)")
     db.commit()
     from ..qc_agent import run_qc_hook
     qc = run_qc_hook(t, db)          # 节点完成路径同样过QC Agent
