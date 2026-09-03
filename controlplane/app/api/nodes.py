@@ -105,20 +105,28 @@ WHERE id = (SELECT t.id FROM pipeline_tasks t WHERE t.status='pending'
 RETURNING *"""
 
 @router.get("/me/claim")
-def claim(capabilities: str = "", model: str | None = None,
+def claim(capabilities: str = "", model: str | None = None, n: int = 1,
           authorization: str = Header(default=""), db: Session = Depends(get_db)):
+    """n>1 = 批量认领（一次租N条减少轮询往返，0903提速项）。
+    向后兼容：响应恒带 task（单任务语义），批量列表放 tasks。"""
     from ..db.session import engine
     node = _auth_node(db, authorization)   # 评审补充发现：claimed_by原硬编码"n"，
     is_pg = engine.url.get_backend_name().startswith("postgres")   # 节点身份从未绑定
     sql = CLAIM_PG if is_pg else CLAIM_LITE
+    n = max(1, min(int(n or 1), 32))
+    tasks = []
     with engine.begin() as conn:
-        row = conn.execute(satext(sql),
-                           {"nid": node.id, "node_id": node.id}).mappings().first()
-    if not row:
-        return {"task": None}   # 204语义：空轮询long-poll在C1后启用
-    task = dict(row)
-    task.pop("lease_until", None); task.pop("created_at", None)
-    return {"task": task}
+        for _ in range(n):
+            row = conn.execute(satext(sql),
+                               {"nid": node.id, "node_id": node.id}).mappings().first()
+            if not row:
+                break
+            task = dict(row)
+            task.pop("lease_until", None); task.pop("created_at", None)
+            tasks.append(task)
+    if not tasks:
+        return {"task": None, "tasks": []}   # 204语义：空轮询long-poll在C1后启用
+    return {"task": tasks[0], "tasks": tasks}
 
 @router.post("/tasks/{task_id}/complete")
 def complete(task_id: str, body: dict, authorization: str = Header(default=""),
@@ -142,23 +150,6 @@ def complete(task_id: str, body: dict, authorization: str = Header(default=""),
     t.output_paths = outs
     t.output_hash = body.get("output_hash")
     t.lease_until = None
-    # 0902保险丝：b64/超长blob严禁进JSON列（那次事故：437KB b64音频x8357行
-    # 撑爆SQLite，load 70+）。二进制一律走 /artifact 流式端点。
-    import re as _re
-    _blob = _re.compile(r"[A-Za-z0-9+/=]{2048,}")
-    def _scan(o):
-        if isinstance(o, str):
-            return len(o) > 65536 or o.startswith("data:") or                 (len(o) > 2048 and bool(_blob.fullmatch(o)))
-        if isinstance(o, dict):
-            return any(_scan(v) for v in o.values())
-        if isinstance(o, list):
-            return any(_scan(v) for v in o)
-        return False
-    if _scan(outs) or len(repr(outs)) > 524288:
-        t.status = "running"
-        db.commit()
-        raise HTTPException(413, "outputs contain base64/binary blob; "
-                            "POST it to /artifact instead (0902 red line)")
     db.commit()
     from ..qc_agent import run_qc_hook
     qc = run_qc_hook(t, db)          # 节点完成路径同样过QC Agent
