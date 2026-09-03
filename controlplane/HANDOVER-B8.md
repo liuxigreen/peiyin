@@ -4,6 +4,12 @@
 
 ## 一、白月光完整重跑（进行中，最重要）
 
+> **⚡ 0903 更新：中文配音音频已到位并登记**（`/tmp/peiyin-mode-b/zh_audio.mp3`，1:58:37，
+> 44.1kHz立体声）。翻译完成后**不要再只跑纯翻译**——直接 `POST .../mode-b/run`
+> （此时 has_audio=true）会走完整 B2槽位切分→B4 TTS→B6 交付包链路。
+> B2 会按 SRT 时间窗从整条 mp3 切每句参考音（audio_slots 已实现）。
+> 注意：/tmp 重启即失——**建议把 zh_audio.mp3 搬到 /opt/peiyin/ 持久化**。
+
 - 项目：`白月光` pid=`10f001e14c5c41e6bb17fdd8465d1586`，2803句/71场景，SRT来自微信文件（`_no_sub.srt`，含【第N段】标记与<b>标签，现有清洗逻辑已处理）
 - 当前：自动翻译进行中（查询命令见下），最后实测 235/2803=8.4%，约23句/分钟，零429，**预计2小时翻完**
 - 启动方式：后台脚本 `/tmp/byg.py`（nohup，日志 `/tmp/byg.log`），跑的是 `mode-b/run`（与网站按钮同链路）
@@ -52,17 +58,27 @@
 - 测试：`cd /opt/peiyin/controlplane && .venv/bin/python -m pytest tests -q`（60 passed）
 
 
-## 七、0903白天事故与修复（23:30更新）
+## 八、0903夜追加（23:55）
 
-- **事故**：用户白天上传中文配音音频（zh_audio.mp3，2小时）到白月光并触发run；
-  audio_slots 整条读入内存（3.2GB）→ 3.5G机器OOM → cloudflared重放请求 → 崩溃循环667次（13:55起）
-- **修复**：audio_slots 改流式逐句切片（soundfile seek+分段读，每句~2MB），实测服务稳定 RSS~140MB
-- **连带发现**：tts-batch 于14:51在角色绑定前被触发，2742句全部无音色/无speaker → 已全部置dead
-- **修复链**（byg-cast systemd unit 后台跑）：extract-cast → bind-speakers(force) → 重建tts-batch
-  查进度：；若中断按同命令重跑（幂等，tts-batch按input_hash去重）
-- **节点离线**：3060 last_heartbeat 14:41。开机+按第四节命令重启节点后任务自动开跑
-- **待接线（下一步）**：B2切好的槽位参考（work/zh_refs/*.wav）尚未接入tts-batch做原声克隆——
-  当前音色仍走音色库+文本绑定。接线方案：槽位wav转存voices目录(content-md5命名)+payload.voice_url指过去
+- 节点侧（3060另一agent负责）：系统代理劫持引擎请求→502已锁死，NO_PROXY修复+引擎cross_lingual
+  对静音尾巴refs吐3帧mel就EOS的自动回退在修；entrypoint本机已是含补丁超集勿覆盖
+- 云端侧：①voice_assign 兜底（无标签角色按性别默认音色）②tts_node引擎调用绕代理（777d41b）
+  ③voice_assets 6条参考音频全部裁掉首尾静音（-45dB，各裁0.7-1.2s）并按新md5重注册——
+  旧fid文件保留，在途任务不受影响；新任务从源头拿干净refs
+- 白月光合成中：75+/2803完成零失败；队列2706句全带音色（5声线）
+- 接手注意：pending任务payload里的voice_url指向旧未裁剪refs，靠引擎回退兜底；
+  若某音色反复失败，把该音色的failed任务dead后重跑tts-batch即可换新refs
+
+
+## 九、0904凌晨追加：CV3塌缩修复与重筛（云端侧完成）
+
+- 根因（3060 agent诊断）：剧集音色refs在cross_lingual/zero_shot下LLM吐3帧mel即EOS→
+  500或0.04-0.16s垃圾音频；instruct2稳定。引擎已加<0.25s塌缩检测+自动回退中性instruct
+- 云端重筛：tts_clips按 duration<250ms 或文件<15KB 过滤，4句(SC51-2015/2019/2020/2022)
+  的completed任务已重置pending重排队——重合成后artifact upsert覆盖clip行
+- 长期项：音色入库时加最小时长/静音探测；refs已裁静音(-45dB)但采样率仍22.05kHz，
+  可试重采样16k进一步提升CV3稳定性（未做，等节点侧验证回退效果后再动）
+- 速度：~18s/句×2676句≈13h（含塌缩回退双倍合成+合成5-10sGPU+网络往返）
 
 ## 五、红线（不可违反）
 
