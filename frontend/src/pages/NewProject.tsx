@@ -11,6 +11,7 @@ export default function NewProject() {
   const [lang, setLang] = useState('en')
   const [srtFile, setSrtFile] = useState<File | null>(null)
   const [srtText, setSrtText] = useState('')
+  const [trFile, setTrFile] = useState<File | null>(null)
   const [audioFile, setAudioFile] = useState<File | null>(null)
   const [videoFile, setVideoFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
@@ -33,6 +34,12 @@ export default function NewProject() {
       const pid = p.id
       if (mode === 'B') {
         await api.post(`/api/projects/${pid}/seed-srt`, { srt: srtText, scene_size: 40 })
+        if (trFile) {
+          const trText = await trFile.text()
+          const st = await api.post<{ matched: number; skipped_not_translated: number }>(
+            `/api/projects/${pid}/seed-translation`, { srt: trText, lang })
+          if (!st.matched) throw new Error('翻译字幕没对上任何一句（请确认上传的是含译文的 SRT）')
+        }
         if (audioFile) {
           const fd = new FormData()
           fd.append('file', audioFile)
@@ -116,6 +123,18 @@ export default function NewProject() {
                  onChange={e => pickSrt(e.target.files?.[0] ?? null)} />
         </div>
         <div className="field">
+          <label>翻译字幕（可选，双语或纯译文 SRT；上传后跳过 AI 翻译直接配音）</label>
+          <div className="dropzone"
+               onDragOver={e => e.preventDefault()}
+               onDrop={e => { e.preventDefault(); setTrFile(e.dataTransfer.files[0]) }}
+               onClick={() => document.getElementById('tr-in')?.click()}>
+            {trFile ? `✅ ${trFile.name}（将按行对齐中文字幕，AI 翻译将被跳过）`
+                    : '已有翻译？拖拽译文 SRT 到此处，或点击选择'}
+          </div>
+          <input id="tr-in" type="file" accept=".srt,text/plain" hidden
+                 onChange={e => setTrFile(e.target.files?.[0] ?? null)} />
+        </div>
+        <div className="field">
           <label>中文配音音频（wav/mp3，按字幕时间轴整条录制；可选，稍后可补传）</label>
           <div className="dropzone"
                onDragOver={e => e.preventDefault()}
@@ -163,7 +182,9 @@ export default function NewProject() {
       </button>
       {mode === 'B' && (
         <div className="dim" style={{ marginTop: 10, fontSize: 12 }}>
-          流程：字幕解析 → 五步链翻译 → 音节校验 → 交付包（外语 SRT/ASS + 分句配音）→ 详情页下载
+          {trFile
+            ? '流程：字幕解析 → 使用你上传的翻译（跳过 AI 翻译）→ 交付包（外语 SRT/ASS + 分句配音）→ 详情页下载'
+            : '流程：字幕解析 → 五步链翻译 → 音节校验 → 交付包（外语 SRT/ASS + 分句配音）→ 详情页下载'}
         </div>
       )}
     </div>
