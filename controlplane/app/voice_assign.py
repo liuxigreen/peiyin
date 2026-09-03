@@ -52,6 +52,22 @@ def assign_voice(db: Session, project: Project, speaker: Speaker | None) -> dict
             params = a.tts_params or {}
             out["engine"] = out["engine"] or params.get("engine")
             out["rate"] = out["rate"] or params.get("rate")
+    # 兜底：龙套/群众角色（性别年龄为空或无标签命中）按性别给默认音色，
+    # 避免'20个人物失败'式全 NONE 单音色回退（0903白月光教训）
+    if out["ref_audio"] is None:
+        g = (meta.get("gender") or "") if isinstance(meta, dict) else ""
+        want = "female" if g == "female" else "male"
+        for a in db.query(VoiceAsset).all():
+            if want in set(a.tags or []):
+                fb = a
+                break
+        if fb is None:
+            fb = db.query(VoiceAsset).first()
+        if fb is not None:
+            out["ref_audio"] = fb.ref_audio_r2_key
+            params = fb.tts_params or {}
+            out["engine"] = out["engine"] or params.get("engine")
+            out["rate"] = out["rate"] or params.get("rate")
 
     # L3：项目级默认 + 主角语气
     cfg = (project.config or {}).get("tts") or {}
