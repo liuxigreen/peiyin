@@ -55,7 +55,15 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
 
 @router.get("/projects/{pid}/progress")
 def project_progress(pid: str, db: Session = Depends(get_db)):
-    tasks = db.query(PipelineTask).filter_by(project_id=pid).all()
+    # 0905 OOM根因#2：progress被前端10s轮询，全量ORM加载5000+行（含output_paths
+    # 大字段）→RSS 100MB→1.6GB→被杀。只取聚合需要的轻列，output_paths/永进内存。
+    from collections import namedtuple as _nt
+    _Row = _nt("PTask", "task_key task_type resource status created_at")
+    tasks = [_Row(k, tt, r, st, ca) for (k, tt, r, st, ca) in
+             (db.query(PipelineTask.task_key, PipelineTask.task_type,
+                       PipelineTask.resource, PipelineTask.status,
+                       PipelineTask.created_at)
+                .filter_by(project_id=pid).all())]
     W = {"gpu": 5, "cpu": 2, "io": 1}
     total = sum(W.get(t.resource, 1) for t in tasks) or 1
     done_w = sum(W.get(t.resource, 1) for t in tasks if t.status == "completed")
