@@ -147,3 +147,10 @@ python entrypoint.py
 - [ ] **TASK-8 重启节点**（`NODE_MODE=real`），等 DIARIZE/1788539135 任务（前20分钟413句）自动认领
 - [ ] **TASK-9 确认**：日志应出现 `[diarize] fetching audio` → 167MB 下载 → `[diarize] embed N/413` → 产物回传
 - 首次跑 pyannote 需要 `HUGGINGFACE_TOKEN` 环境变量（下载 embedding 模型）
+
+## 0905晚 diarize测试批（TASK-10~12，替代TASK-7~9）
+
+- [ ] **TASK-10** `git pull origin main`（b8e4aca）——diarize_node.py 含 zh_audio_url 下载+import兜底
+- [ ] **TASK-11** `NODE_MODE=real` + `HUGGINGFACE_TOKEN` 重启节点；DIARIZE/1788539135（前20分钟413句）自动认领
+- [ ] **TASK-12** 确认日志链：`[diarize] fetching audio` → 167MB → `embed N/413` → 回传
+- 排障：若仍报 relative import → 检查本机 stages/router.py 是否含 `from . import diarize_node`（旧版没有，需用仓库版）
