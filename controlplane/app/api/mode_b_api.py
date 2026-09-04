@@ -1,6 +1,7 @@
 """模式B API：无视频流程（字幕+中文配音 → 交付包）"""
 from __future__ import annotations
 
+import json as _json
 import os
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -396,6 +397,47 @@ def download_package(pid: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "交付包未生成")
     return FileResponse(os.path.join(pkg, zips[0]), filename=zips[0],
                         media_type="application/zip")
+
+
+@router.post("/projects/{pid}/mode-b/diarize")
+def create_diarize_task(pid: str, body: dict, db: Session = Depends(get_db)):
+    """创建声纹聚类任务（3060节点执行pyannote）。
+    前置：zh_audio.mp3 已上传（mode_b_audio 配置）。payload 携带
+    整条音频的下载URL（节点经 /api/nodes/voices/ 通道拉取）+ 全部slot窗口。
+    完成后 artifact diarize_result.json → LLM 簇绑定 → 克隆重合成。"""
+    import datetime as _dt
+    from ..db.models import PipelineTask
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    audio_path = (p.config or {}).get("mode_b_audio")
+    if not audio_path or not os.path.exists(audio_path):
+        raise HTTPException(400, "zh_audio not uploaded; POST upload-file first")
+    utts = (db.query(Utterance).filter_by(project_id=pid)
+              .order_by(Utterance.seq_index).all())
+    slots = [{"uid": u.uid, "start_ms": u.start_ms, "end_ms": u.end_ms}
+             for u in utts if (u.end_ms or 0) > (u.start_ms or 0)]
+    # 节点拉音频的URL：复用 voices 静态通道（文件名白名单外挂一个注册表）
+    vid = "zh" + _dt.datetime.now().strftime("%m%d%H%M")
+    reg = os.path.join(os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b"), "voices_registry.json")
+    reg_data = {}
+    if os.path.exists(reg):
+        reg_data = _json.load(open(reg))
+    reg_data[vid + ".mp3"] = audio_path
+    _json.dump(reg_data, open(reg, "w"))
+    ts = int(_dt.datetime.now().timestamp())
+    t = PipelineTask(
+        project_id=pid, task_key=f"DIARIZE/{ts}", task_type="diarize",
+        resource="gpu", gpu_required=True, weight=5, depends_on=[],
+        input_hash=f"diarize:{pid}:{ts}", status="pending",
+        output_paths={"payload": {
+            "project_id": pid, "zh_audio_url": f"/api/nodes/voices/{vid}.mp3",
+            "srt_slots": slots}})
+    db.add(t)
+    db.commit()
+    return {"ok": True, "task_id": t.id, "slots": len(slots),
+            "audio_url": f"/api/nodes/voices/{vid}.mp3",
+            "note": "节点跑完回传 diarize_result.json"}
 
 
 @router.post("/projects/{pid}/bind-speakers")

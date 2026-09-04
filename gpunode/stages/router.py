@@ -25,4 +25,5 @@ else:
     from . import demo as _impl     # noqa: F401,E402
     from . import tts_node as _tts  # noqa: F401,E402  # TTS节点：3060等GPU机器
     from . import separate_node as _sep  # noqa: F401,E402  # 人声分离：Demucs
+    from . import diarize_node as _dia   # noqa: F401,E402  # 声纹聚类：pyannote
     # G0: from . import real stages here

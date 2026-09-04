@@ -2,7 +2,7 @@
 register / claim(原子领取) / heartbeat / complete / fail / 节点列表
 生产Postgres走 SKIP LOCKED（app/core/queue.py），sqlite退化用事务内
 status条件更新实现同语义——两方言均保证不重复派发。"""
-import hashlib, os, secrets
+import hashlib, json as _json, os, re as _re, secrets
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import text as satext
@@ -187,6 +187,33 @@ def invalidate_voice_cache():
     """新音色入库后调用（管理端点/重启自然失效）。"""
     global _voice_index_cache
     _voice_index_cache = None
+
+
+@router.get("/voices/registry.json")
+def get_voice_registry():
+    """节点拉取注册表（zh_audio 等整条音频映射）。"""
+    import json as _json
+    reg_path = os.path.join(os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b"),
+                            "voices_registry.json")
+    if os.path.exists(reg_path):
+        return _json.load(open(reg_path))
+    return {}
+
+
+@router.get("/voices/zhaudio/{name}")
+def get_zh_audio(name: str):
+    """节点拉取整条原配音音频（diarize/克隆用）。名字白名单。"""
+    import json as _json
+    from fastapi.responses import FileResponse
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
+        raise HTTPException(400)
+    reg_path = os.path.join(os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b"),
+                            "voices_registry.json")
+    mapping = _json.load(open(reg_path)) if os.path.exists(reg_path) else {}
+    src = mapping.get(name)
+    if src and os.path.exists(src):
+        return FileResponse(src, filename=name, media_type="audio/mpeg")
+    raise HTTPException(404)
 
 
 @router.get("/voices/{fid}.wav")
