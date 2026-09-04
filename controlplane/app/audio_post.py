@@ -44,9 +44,11 @@ def condition_line(src: str, dst: str, pre_ms: int = 40, post_ms: int = 140,
              "alimiter=limit=0.84:attack=5:release=50:asc=0",
              f"apad=pad_dur={post_ms/1000:.3f}"]
     if breath:
-        args = [FF, "-y", "-i", src, "-i", breath, "-filter_complex",
-                f"[0:a]{','.join(chain)}[v];"
-                f"[v][1:a]concat=n=2:v=0:a=1",
+        # P0修复(0905审计)：呼吸在台词前（呼吸→台词），此前concat顺序反了
+        args = [FF, "-y", "-i", breath, "-i", src, "-filter_complex",
+                f"[0:a]volume=-22dB[b];"
+                f"[1:a]{','.join(chain)}[v];"
+                f"[b][v]concat=n=2:v=0:a=1",
                 "-ar", "48000", dst]
     else:
         args = [FF, "-y", "-i", src, "-af", ",".join(chain), "-ar", "48000", dst]
@@ -80,8 +82,11 @@ def master_mix(lines: list[dict], out_path: str, total_ms: int,
         labels.append(f"[a{i}]")
     parts.append(f"[0:a]{''.join(labels)}amix=inputs={len(lines)+1}:normalize=0[dlg]")
     if me_path:
+        # P0修复(0905审计)：M&E是最后一个输入，索引必须动态算（此前写死[2:a]，
+        # 多句项目里拿的是第二句台词做sidechain——M&E根本没进混音）
+        me_idx = 1 + len(lines)
         parts.append("[dlg]asplit=2[d1][d2]")
-        parts.append("[2:a][d1]sidechaincompress=threshold=0.05:ratio=4.5:"
+        parts.append(f"[{me_idx}:a][d1]sidechaincompress=threshold=0.05:ratio=4.5:"
                      "attack=25:release=260:makeup=1.0:link=average[duck]")
         parts.append("[duck][d2]amix=inputs=2:duration=first:normalize=0[pre]")
     else:

@@ -272,11 +272,10 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
             markers += 1
             continue
         emo = (getattr(u, "emotion_label", "") or "").strip()
-        if emo and emo != "neutral":
-            # 台词级情绪须在_tts_payload内转换成instruct（节点只认instruct），
-            # 传入body让转换链生效；payload里仍保留emotion标签
-            body = {**body, "emotion": emo}
-        payload, _ = _tts_payload(db, p, u, latest, body)
+        # P0修复(0905审计)：必须每句独立line_body——此前body={**body,...}污染
+        # 循环外层，上一句的emotion会串到后续neutral句（情绪串台）
+        line_body = {**body, "emotion": emo} if (emo and emo != "neutral") else dict(body)
+        payload, _ = _tts_payload(db, p, u, latest, line_body)
         if emo and emo != "neutral" and "emotion" not in payload:
             payload["emotion"] = emo
         ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"

@@ -136,7 +136,8 @@ def mux_video(video: str, dub_audio: str, out_path: str, ass_path: str | None = 
     if loudnorm:
         m = loudnorm_measure(dub_audio)
         try:
-            af = ("loudnorm=I=-16:TP=-1.5:LRA=11"
+            _tgt = os.getenv("MASTER_LUFS", "13")
+            af = (f"loudnorm=I=-{_tgt}:TP=-1.5:LRA=11"
                   f":measured_I={m['input_i']}:measured_TP={m['input_tp']}"
                   f":measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}"
                   f":offset={m.get('target_offset', '0')}:linear=true")
@@ -211,7 +212,9 @@ def qc_report(media_path: str, expect_duration_ms: int | None = None) -> dict:
         drift = round(abs(dur_ms - expect_duration_ms) / 1000, 2)
     return {
         "lufs": lufs,
-        "lufs_pass": lufs is not None and abs(lufs + 16) <= 1.5,
+        # 0905审计P1：与audio_post.master_mix的-13 LUFS对齐（此前QC判-16，正常
+        # -13母带会被判fail）。目标值统一从env读，master与QC同源
+        "lufs_pass": lufs is not None and abs(lufs + float(os.getenv("MASTER_LUFS", "13"))) <= 1.5,
         "unexpected_silences": len(silences),
         "silence_pass": len(silences) == 0,
         "duration_ms": dur_ms,
