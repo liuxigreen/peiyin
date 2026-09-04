@@ -68,3 +68,10 @@ async def spa_fallback(request, exc):
 
 if _dist.exists():
     app.mount("/assets", StaticFiles(directory=str(_dist / "assets")), name="assets")
+
+
+# 租约收割后台线程：节点掉线后过期running任务自动回队列（0904教训：39句卡死8小时）
+from orchestrator_reaper import start_background_reaper  # noqa: E402
+from db.session import SessionLocal  # noqa: E402
+
+start_background_reaper(SessionLocal, interval_s=60)
