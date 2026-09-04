@@ -201,3 +201,10 @@ curl -s https://dubbing.mulan.dpdns.org/api/projects | head -c 200        # 只�
 ```
 
 全绿后从 §二 第 1 步开始干活。
+
+## ⏸ 挂起状态（0902 部署完成后）
+- 新盘部署✅ 隧道✅ 音色✅ 服务商链✅（MiniMax-M3+4兜底，key网页配置）
+- 多角色链路已实测：项目`48edb4d4`（节点连通测试，4句2声线，试听包可下载）
+- **等两样**：①用户网页传白月光SRT（或告知Mac路径，命令行灌）②白月光项目名必须叫「白月光」
+- SRT到位后自动跑：translate→extract-cast→bind-speakers→tts-batch(cosyvoice_api,rate1.25)→package
+- 节点在线，voice_url拉取已验证；本地main领先origin/main 2提交(8e65119,1241420)未推
