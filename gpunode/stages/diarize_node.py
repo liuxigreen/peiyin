@@ -16,7 +16,15 @@ import shutil
 
 import numpy as np
 
-from .router import register
+try:
+    from .router import register
+except ImportError:                       # 节点以脚本/动态方式加载时的兜底（0905实测坑）
+    import importlib.util as _ilu, os as _os
+    _spec = _ilu.spec_from_file_location(
+        "router", _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "router.py"))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    register = _mod.register
 
 WORKDIR = os.getenv("NODE_WORKDIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workdir"))
 REF_DIR = os.path.join(WORKDIR, "zh_refs")
