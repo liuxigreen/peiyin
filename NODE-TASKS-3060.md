@@ -141,3 +141,9 @@ python entrypoint.py
 - 改完在本文件打勾 + commit + push，云端 agent 拉取后在 HANDOVER-B8.md 记录验证结果
 - 塌缩垃圾云端会重筛重排队（duration<250ms / 文件<15KB），节点侧不用管
 - 云端 git 提交参考：`ef2c47e`（claim 批量）、`777d41b`（tts_node 绕代理——本机已用 NO_PROXY 等效处理，合并时取其代码级写法）
+## 测试批等待中（0905）
+
+- [ ] **TASK-7 拉取最新代码**：`git pull origin main`（77d8a1b）——`stages/diarize_node.py` 已含 zh_audio_url 下载通道（此前"attempted relative import"是本机旧版文件，云端已验证 import 结构 OK）
+- [ ] **TASK-8 重启节点**（`NODE_MODE=real`），等 DIARIZE/1788539135 任务（前20分钟413句）自动认领
+- [ ] **TASK-9 确认**：日志应出现 `[diarize] fetching audio` → 167MB 下载 → `[diarize] embed N/413` → 产物回传
+- 首次跑 pyannote 需要 `HUGGINGFACE_TOKEN` 环境变量（下载 embedding 模型）
