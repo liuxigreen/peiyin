@@ -46,31 +46,41 @@ def _cut_slots(zh_audio: str, slots: list[dict]) -> list[dict]:
     return out
 
 
-def _download_zh_audio(url: str, dst: str) -> str:
-    """从控制面拉整条原配音（registry映射→FileResponse）。167MB走keep-alive。"""
-    import httpx
-    from ..entrypoint import CONTROL, state
-    r = httpx.get(f"{CONTROL}{url}", headers={"Authorization": f"Bearer {state['token']}"},
-                  timeout=600, follow_redirects=True)
-    r.raise_for_status()
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    with open(dst, "wb") as f:
-        f.write(r.content)
-    print(f"[diarize] zh_audio downloaded: {len(r.content)>>20}MB", flush=True)
-    return dst
-
-
 @register("diarize")
 def run_diarize(task: dict) -> list[dict]:
     payload = task.get("payload") or {}
     zh_audio = payload.get("zh_audio") or ""
     slots = payload.get("srt_slots") or []
+    # ff4bc25：payload.zh_audio_url 鉴权下载通道——节点本地无音频时经控制面拉取
+    if (not zh_audio or not os.path.exists(zh_audio)) and payload.get("zh_audio_url"):
+        import urllib.request as _u
+        base = os.getenv("CONTROL_URL", "").rstrip("/")
+        token = ""
+        try:
+            tf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "node_token.txt")
+            token = open(tf).read().strip()
+        except Exception:
+            pass
+        if base and token:
+            url = base + payload["zh_audio_url"]
+            req = _u.Request(url, headers={"Authorization": f"Bearer {token}"})
+            zh_audio = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "workdir", "zh_audio.mp3")
+            print(f"[diarize] fetching audio {url} -> {zh_audio}", flush=True)
+            with _u.urlopen(req, timeout=1800) as resp, open(zh_audio, "wb") as f:
+                total = 0
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    total += len(chunk)
+                    if total % (50 << 20) < (1 << 20):
+                        print(f"[diarize] audio {total>>20}MB", flush=True)
+            print(f"[diarize] audio {total>>20}MB done", flush=True)
     if not zh_audio or not os.path.exists(zh_audio):
-        # 云端下发下载URL：节点经鉴权通道拉取（167MB，~2-5分钟）
-        url = payload.get("zh_audio_url")
-        if not url:
-            raise RuntimeError(f"zh_audio not found and no zh_audio_url: {zh_audio!r}")
-        zh_audio = _download_zh_audio(url, os.path.join(REF_DIR, "_zh_full.mp3"))
+        raise RuntimeError(f"zh_audio not found on node: {zh_audio}")
     if not slots:
         raise RuntimeError("srt_slots empty")
     if shutil.which("ffmpeg") is None:
