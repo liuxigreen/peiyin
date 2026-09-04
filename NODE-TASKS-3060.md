@@ -161,3 +161,10 @@ python entrypoint.py
 - DIARIZE/1788539135（前20分钟413句）已重新入队，节点拉 b8e4aca+ 代码即可认领
 - 预期日志：`[diarize] fetching audio` →167MB→ `embed N/413` → artifact回传
 - 跑完后**云端全自动**：闸门B→簇绑定→试听包，无需节点再操作
+
+## 0905 Tailscale已通，差公钥回铺（TASK-13）
+
+- [ ] **TASK-13** 把 ECS 公钥追加到 `C:\ProgramData\ssh\administrators_authorized_keys`（一行，注意 Windows 权限 ACL 已收紧则直接 append）：
+  `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEeJ2NS1WncRP6Y1rXNgF+j9uV7JWgExLSJm4sx9IP0u root@iZbp1d8pq7f99dzjc7tiwlZ`
+- 追加后无需要求其他操作，云端 agent 会立即 ssh 验证并接管节点运维
+- tailnet 状态：ecs-controlplane(100.77.187.54) ↔ desktop-g03fa3p(100.67.15.30) 直连 OK，SSH 22 可达待公钥
