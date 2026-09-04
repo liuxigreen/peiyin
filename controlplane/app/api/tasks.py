@@ -55,28 +55,15 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
 
 @router.get("/projects/{pid}/progress")
 def project_progress(pid: str, db: Session = Depends(get_db)):
-    tasks = db.query(PipelineTask).filter_by(project_id=pid).all()
-    # 模式B纯翻译项目：无DAG任务但有utterances → 返回真实翻译进度
-    if not tasks:
-        from ..db.models import Translation, Utterance
-        total = db.query(Utterance).filter_by(project_id=pid).count()
-        if total:
-            proj = db.get(Project, pid)
-            lang = proj.target_lang if proj else "en"
-            utts = db.query(Utterance).filter_by(project_id=pid).all()
-            utt_ids = {u.id for u in utts}
-            done = 0
-            seen_utt = set()
-            for t in (db.query(Translation).filter_by(target_lang=lang)
-                        .order_by(Translation.version).all()):
-                if t.utterance_id in utt_ids and t.text and "MISSING" not in t.text:
-                    seen_utt.add(t.utterance_id)
-            done = len(seen_utt)
-            phases = {"translate": {"total": total, "done": done, "failed": 0}}
-            return {"percent": round(done / total * 100, 1), "phases": phases,
-                    "counts": {"pending": 0, "queued": 0, "running": 0,
-                               "completed": done, "failed": 0, "dead": 0},
-                    "recent_tasks": [], "mode": "B-translation"}
+    # 0905 OOM根因#2：progress被前端10s轮询，全量ORM加载5000+行（含output_paths
+    # 大字段）→RSS 100MB→1.6GB→被杀。只取聚合需要的轻列，output_paths/永进内存。
+    from collections import namedtuple as _nt
+    _Row = _nt("PTask", "task_key task_type resource status created_at")
+    tasks = [_Row(k, tt, r, st, ca) for (k, tt, r, st, ca) in
+             (db.query(PipelineTask.task_key, PipelineTask.task_type,
+                       PipelineTask.resource, PipelineTask.status,
+                       PipelineTask.created_at)
+                .filter_by(project_id=pid).all())]
     W = {"gpu": 5, "cpu": 2, "io": 1}
     total = sum(W.get(t.resource, 1) for t in tasks) or 1
     done_w = sum(W.get(t.resource, 1) for t in tasks if t.status == "completed")

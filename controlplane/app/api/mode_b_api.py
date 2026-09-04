@@ -417,6 +417,10 @@ def create_diarize_task(pid: str, body: dict, db: Session = Depends(get_db)):
               .order_by(Utterance.seq_index).all())
     slots = [{"uid": u.uid, "start_ms": u.start_ms, "end_ms": u.end_ms}
              for u in utts if (u.end_ms or 0) > (u.start_ms or 0)]
+    # 小步验证（B9纪律）：minutes参数限定前N分钟片段，验收后再全量
+    minutes = int((body or {}).get("minutes") or 0)
+    if minutes:
+        slots = [x for x in slots if (x["end_ms"] or 0) <= minutes * 60_000]
     # 节点拉音频的URL：复用 voices 静态通道（文件名白名单外挂一个注册表）
     vid = "zh" + _dt.datetime.now().strftime("%m%d%H%M")
     reg = os.path.join(os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b"), "voices_registry.json")
@@ -670,3 +674,58 @@ def seed_translation(pid: str, body: dict, db: Session = Depends(get_db)):
             "matched": matched, "skipped_not_translated": skipped_cjk,
             "index_mismatch": mismatch,
             "note": "下次run-mode-b将跳过这些句子的API翻译"}
+
+
+@router.post("/projects/{pid}/mode-b/audition-pack")
+def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
+    """验收试听包（小步验证常设闸门）：按音色分层抽样+主角全覆盖，
+    产出精简zip（wav+清单）。用户耳朵过了才许全量重合成（B9纪律）。"""
+    import os as _os
+    import zipfile as _zip
+    from ..db.models import PipelineTask, TtsClip
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    per_voice = int((body or {}).get("per_voice") or 2)
+    storage = _os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+    out_dir = _os.path.join(storage, pid[:8], "audition")
+    _os.makedirs(out_dir, exist_ok=True)
+    rows = (db.query(TtsClip, Utterance)
+              .join(Utterance, TtsClip.utterance_id == Utterance.id)
+              .filter(Utterance.project_id == pid,
+                      TtsClip.status == "completed")
+              .order_by(Utterance.seq_index).all())
+    trs = {t.utterance_id: t for t in db.query(Translation)
+           .filter_by(target_lang=p.target_lang).order_by(Translation.version)}
+    # 从pipeline_tasks payload取voice_id映射（tts_clips无voice列）
+    voice_of = {}
+    for (op,) in db.query(PipelineTask.output_paths).filter(
+            PipelineTask.project_id == pid,
+            PipelineTask.task_type == "tts-generate",
+            PipelineTask.status == "completed").all():
+        pay = (json.loads(op) if isinstance(op, str) else (op or {})).get("payload", {})
+        if pay.get("uid"):
+            voice_of[pay["uid"]] = pay.get("voice_id") or "unknown"
+    seen = {}
+    picked = []
+    for clip, u in rows:
+        v = voice_of.get(u.uid, "unknown")
+        seen.setdefault(v, 0)
+        if seen[v] < per_voice:
+            seen[v] += 1
+            picked.append((clip, u, v))
+    manifest = []
+    with _zip.ZipFile(_os.path.join(out_dir, "audition.zip"), "w") as z:
+        for i, (clip, u, v) in enumerate(picked, 1):
+            if clip.audio_r2_key and _os.path.exists(clip.audio_r2_key):
+                tr = trs.get(u.id)
+                z.write(clip.audio_r2_key, f"{i:02d}_{v}_{u.uid}.wav")
+                manifest.append({"file": f"{i:02d}_{v}_{u.uid}.wav",
+                                 "uid": u.uid, "voice": v,
+                                 "en": (tr.text if tr else "")[:80],
+                                 "zh": (u.original_text or "")[:40]})
+        z.writestr("manifest.json", json.dumps(
+            {"project": p.name, "voices": sorted(seen),
+             "lines": manifest}, ensure_ascii=False, indent=1))
+    return {"ok": True, "voices": sorted(seen), "lines": len(manifest),
+            "download": f"/api/projects/{pid}/mode-b/file/audition/audition.zip"}
