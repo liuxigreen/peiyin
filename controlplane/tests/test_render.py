@@ -80,5 +80,5 @@ def test_mux_no_ass(tmp_path):
     _make_video(video, 3.0)
     wav = str(tmp_path / "d.wav")
     _make_wav(wav, 3.0, freq=300)
-    out = mux_video(video, wav, str(tmp_path / "f.mp4"), loudnorm=False)
+    out = mux_video(video, wav, str(tmp_path / "f.mp4"), loudnorm=True)
     assert os.path.getsize(out) > 5000

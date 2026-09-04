@@ -57,7 +57,8 @@ def assign_voice(db: Session, project: Project, speaker: Speaker | None) -> dict
     if out["ref_audio"] is None:
         g = (meta.get("gender") or "") if isinstance(meta, dict) else ""
         want = "female" if g == "female" else "male"
-        for a in db.query(VoiceAsset).all():
+        fb = None                        # P0修复(0905审计)：必须先初始化，
+        for a in db.query(VoiceAsset).all():   # 零匹配时原代码UnboundLocalError
             if want in set(a.tags or []):
                 fb = a
                 break
