@@ -95,8 +95,11 @@ RETURNING *"""
 
 CLAIM_LITE = """UPDATE pipeline_tasks SET status='running', claimed_by=:nid,
     lease_until=datetime('now','+10 minutes'), heartbeat_at=datetime('now')
-WHERE id = (SELECT t.id FROM pipeline_tasks t WHERE t.status='pending'
-    AND NOT EXISTS (
+WHERE id = (SELECT id FROM (
+      SELECT id, task_key, depends_on, priority, created_at, project_id
+      FROM pipeline_tasks WHERE status='pending'
+      ORDER BY priority DESC, created_at ASC LIMIT 50) t
+    WHERE NOT EXISTS (
       SELECT 1 FROM json_each(COALESCE(t.depends_on, json('[]'))) dep
       JOIN pipeline_tasks up ON up.project_id = t.project_id
         AND up.task_key = dep.value

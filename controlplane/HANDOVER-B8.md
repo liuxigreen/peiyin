@@ -95,6 +95,16 @@
 预期1+2+4→18s压到6-9s；3消网络串行；再叠多节点是乘法
 进度：171/2803完成（含塌缩回退双倍合成，实际速率~2.4句/分），引擎侧修复后回落正常线
 
+
+## 十一、claim性能修复（0904凌晨，3060 agent报障）
+
+- 现象：claim单次15-30s（n=1实测16.6s）。根因：CLAIM_LITE对2700条pending逐条做
+  json_each+JOIN依赖检查（每条~6ms）×delete模式全库锁=全扫描16s
+- 修复：①claim候选窗口化（只对priority前50做依赖检查）②索引idx_claim(status,priority,created_at)
+  ③journal_mode=wal
+- 实测：单次claim 16.6s→~0.3s（55x），n=8批量≈2.4s/8句；60tests全绿，已提交
+- 节点无需改动即可受益；接入n=8后端到端≈6.4s合成+0.3s认领≈全批6小时
+
 ## 五、红线（不可违反）
 
 1. **b64/二进制禁入 JSON 列**——complete 端点已有保险丝自动拒绝；音频只走 /artifact 流式端点+文件路径
