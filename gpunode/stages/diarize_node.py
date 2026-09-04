@@ -46,13 +46,31 @@ def _cut_slots(zh_audio: str, slots: list[dict]) -> list[dict]:
     return out
 
 
+def _download_zh_audio(url: str, dst: str) -> str:
+    """从控制面拉整条原配音（registry映射→FileResponse）。167MB走keep-alive。"""
+    import httpx
+    from ..entrypoint import CONTROL, state
+    r = httpx.get(f"{CONTROL}{url}", headers={"Authorization": f"Bearer {state['token']}"},
+                  timeout=600, follow_redirects=True)
+    r.raise_for_status()
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as f:
+        f.write(r.content)
+    print(f"[diarize] zh_audio downloaded: {len(r.content)>>20}MB", flush=True)
+    return dst
+
+
 @register("diarize")
 def run_diarize(task: dict) -> list[dict]:
     payload = task.get("payload") or {}
     zh_audio = payload.get("zh_audio") or ""
     slots = payload.get("srt_slots") or []
     if not zh_audio or not os.path.exists(zh_audio):
-        raise RuntimeError(f"zh_audio not found on node: {zh_audio}")
+        # 云端下发下载URL：节点经鉴权通道拉取（167MB，~2-5分钟）
+        url = payload.get("zh_audio_url")
+        if not url:
+            raise RuntimeError(f"zh_audio not found and no zh_audio_url: {zh_audio!r}")
+        zh_audio = _download_zh_audio(url, os.path.join(REF_DIR, "_zh_full.mp3"))
     if not slots:
         raise RuntimeError("srt_slots empty")
     if shutil.which("ffmpeg") is None:
