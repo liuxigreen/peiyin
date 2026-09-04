@@ -27,25 +27,21 @@ def audio_slots(audio_path: str, entries: list[dict], out_dir: str) -> list[dict
     """B2：按SRT时间窗从整条中文配音音频切分每句参考音频。
     返回 [{uid, seq_index, start_ms, end_ms, ref_path, ref_duration_ms}]。"""
     os.makedirs(out_dir, exist_ok=True)
+    data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)
+    total_ms = len(mono) / sr * 1000
     slots = []
-    # 流式切片：seek逐句读（每句~2MB），整条读入2小时音频=3.2GB→OOM(0903事故)
-    with sf.SoundFile(audio_path) as f:
-        sr = f.samplerate
-        total_frames = len(f)
-        total_ms = total_frames / sr * 1000
-        for i, e in enumerate(entries, 1):
-            s = max(0, int(e["start_ms"] / 1000 * sr))
-            en = min(total_frames, int(e["end_ms"] / 1000 * sr))
-            f.seek(s)
-            seg = f.read(frames=max(en - s, 0), dtype="float32", always_2d=True)
-            mono = seg.mean(axis=1) if seg.size else np.zeros(0, dtype="float32")
-            ref = os.path.join(out_dir, f"zh_{i:04d}.wav")
-            sf.write(ref, mono, sr)
-            slots.append({"uid": e.get("uid", f"U{i:04d}"), "seq_index": i,
-                          "start_ms": e["start_ms"], "end_ms": e["end_ms"],
-                          "ref_path": ref,
-                          "ref_duration_ms": int(len(mono) / sr * 1000),
-                          "within_audio": e["end_ms"] <= total_ms + 500})
+    for i, e in enumerate(entries, 1):
+        s = max(0, int(e["start_ms"] / 1000 * sr))
+        en = min(len(mono), int(e["end_ms"] / 1000 * sr))
+        seg = mono[s:en]
+        ref = os.path.join(out_dir, f"zh_{i:04d}.wav")
+        sf.write(ref, seg, sr)
+        slots.append({"uid": e.get("uid", f"U{i:04d}"), "seq_index": i,
+                      "start_ms": e["start_ms"], "end_ms": e["end_ms"],
+                      "ref_path": ref,
+                      "ref_duration_ms": int(len(seg) / sr * 1000),
+                      "within_audio": e["end_ms"] <= total_ms + 500})
     return slots
 
 
@@ -110,7 +106,8 @@ def fit_clip(src_path: str, dst_dir: str, uid: str,
     return out
 
 
-def build_package_from_clips(project: dict, rows: list[dict], out_dir: str) -> str:
+def build_package_from_clips(project: dict, rows: list[dict], out_dir: str,
+                             post: bool = True, me_path: str | None = None) -> str:
     """B6真TTS交付包（区别于mock的build_package）：
     rows=[{uid,seq,start_ms,end_ms,text,audio_path,final_ms,speed,engine,
            over_window,over_limit}]。
@@ -150,12 +147,47 @@ def build_package_from_clips(project: dict, rows: list[dict], out_dir: str) -> s
                    "clips": manifest}, f, ensure_ascii=False, indent=1)
     with open(os.path.join(out_dir, "qc_report.json"), "w", encoding="utf-8") as f:
         json.dump(qc, f, ensure_ascii=False, indent=1)
+    # B7句级后处理：手机扬声器EQ+压缩限幅+边界padding(+说话人切换呼吸声)
+    post_errors, master_path = [], None
+    if post:
+        from app.audio_post import condition_line, make_breath, master_mix
+        aud_dir = os.path.join(out_dir, "audio")
+        os.makedirs(aud_dir, exist_ok=True)
+        breath = make_breath(os.path.join(out_dir, "breath.wav"))
+        kept = [r for r in rows if r.get("audio_path")]
+        for r in kept:
+            try:
+                cond = condition_line(
+                    r["audio_path"],
+                    os.path.join(aud_dir, f"{r['seq']:04d}_{r['uid']}.wav"),
+                    breath=breath if r.get("breath") else None)
+                r["audio_path"] = cond
+            except Exception as e:                               # noqa: BLE001
+                post_errors.append({"uid": r["uid"], "err": str(e)[:120]})
+        if kept:
+            total_ms = max((r.get("end_ms") or 0) for r in kept) + 2000
+            master_path = os.path.join(out_dir, "master_13LUFS.wav")
+            try:
+                mix_info = master_mix(
+                    [{"path": r["audio_path"], "start_ms": r["start_ms"] or 0}
+                     for r in kept],
+                    master_path, total_ms, me_path=me_path, work_dir=out_dir)
+                qc["master_mix"] = {"dur_ms": mix_info["dur_ms"],
+                                    "loudnorm": "I=-13 TP=-1 LRA=6"}
+            except Exception as e:                               # noqa: BLE001
+                post_errors.append({"uid": "MIX", "err": str(e)[:160]})
+                master_path = None
+    qc["post_errors"] = post_errors
+    with open(os.path.join(out_dir, "qc_report.json"), "w", encoding="utf-8") as f:
+        json.dump(qc, f, ensure_ascii=False, indent=1)
     zip_path = os.path.join(out_dir, f"dubbing_package_{project['id'][:8]}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(srt, os.path.basename(srt))
         z.write(ass, os.path.basename(ass))
         z.write(os.path.join(out_dir, "manifest.json"), "manifest.json")
         z.write(os.path.join(out_dir, "qc_report.json"), "qc_report.json")
+        if master_path and os.path.exists(master_path):
+            z.write(master_path, "master_13LUFS.wav")
         for r in rows:
             if r.get("audio_path"):
                 z.write(r["audio_path"], f"audio/{r['seq']:04d}_{r['uid']}.wav")
