@@ -123,8 +123,22 @@ def dispatch(task: dict):
 def main():
     register()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    workers = max(1, int(os.getenv("NODE_WORKERS", "2")))
+    sem = threading.BoundedSemaphore(workers)
+
+    def _worker(t_):
+        try:
+            dispatch(t_)
+        finally:
+            sem.release()
+
+    print(f"[node] worker pool = {workers}")
     while True:
         try:
+            # 非阻塞拿令牌：池满则歇，避免任务堆 积+引擎过载
+            if not sem.acquire(blocking=False):
+                time.sleep(POLL_IDLE)
+                continue
             r = HTTP.get(f"{CONTROL}/api/nodes/me/claim",
                           params={"model": os.getenv("PREFERRED_MODEL") or None},
                           headers={"Authorization": f"Bearer {state['token']}"}, timeout=30)
@@ -132,14 +146,24 @@ def main():
                 print("[claim] token rejected → re-register")
                 os.path.exists(TOKEN_FILE) and os.remove(TOKEN_FILE)
                 register()
+                sem.release()
                 continue
             task = (r.json() or {}).get("task")
-            if task: dispatch(task)
-            else: time.sleep(POLL_IDLE)
+            if task:
+                print(f"[dispatch] {task.get('task_key')} in pool")
+                threading.Thread(target=_worker, args=(task,), daemon=True).start()
+            else:
+                sem.release()
+                time.sleep(POLL_IDLE)
         except KeyboardInterrupt:
             sys.exit(0)
         except Exception as e:
-            print("[claim err]", e); time.sleep(POLL_IDLE)
+            print("[claim err]", e)
+            try:
+                sem.release()
+            except ValueError:
+                pass
+            time.sleep(POLL_IDLE)
 
 if __name__ == "__main__":
     main()

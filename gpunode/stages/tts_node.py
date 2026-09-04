@@ -123,6 +123,10 @@ def _tts_via_http(task: dict, payload: dict, engine: str, text: str,
     data = json.dumps(req_body).encode()
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json"})
+    # 引擎永远在本机(127.0.0.1)：强制直连绕过系统代理——Windows urllib 读注册表
+    # 代理，Clash类代理会劫持本机请求返回502（0903白月光节点僵死元凶）
+    _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    urllib.request.install_opener(_opener)
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=TTS_TIMEOUT) as resp:
         raw = resp.read()
