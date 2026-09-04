@@ -154,3 +154,10 @@ python entrypoint.py
 - [ ] **TASK-11** `NODE_MODE=real` + `HUGGINGFACE_TOKEN` 重启节点；DIARIZE/1788539135（前20分钟413句）自动认领
 - [ ] **TASK-12** 确认日志链：`[diarize] fetching audio` → 167MB → `embed N/413` → 回传
 - 排障：若仍报 relative import → 检查本机 stages/router.py 是否含 `from . import diarize_node`（旧版没有，需用仓库版）
+
+## 0905深夜 diarize测试批重派（TASK-10~12仍有效，补充）
+
+- 云端已修第二个OOM（网站progress轮询全量加载5000行task），服务稳定
+- DIARIZE/1788539135（前20分钟413句）已重新入队，节点拉 b8e4aca+ 代码即可认领
+- 预期日志：`[diarize] fetching audio` →167MB→ `embed N/413` → artifact回传
+- 跑完后**云端全自动**：闸门B→簇绑定→试听包，无需节点再操作
