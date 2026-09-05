@@ -4,7 +4,7 @@ import { api } from '../api/client'
 import { IcPlus, IcFilm } from '../components/Icons'
 
 const STATUS_ZH: Record<string, string> = {
-  completed: '已完成', processing: '处理中', failed: '失败', created: '已建库',
+  completed: '已完成', processing: '处理中', failed: '失败', created: '待翻译',
   analyzing: '预分析中', analyzed: '已预分析',
 }
 
@@ -36,6 +36,24 @@ export default function Projects() {
     const t = setInterval(load, 10000)
     return () => { alive = false; clearInterval(t) }
   }, [])
+
+  // 可交付状态聚合（0906审计P1）：生成≠可交付，制作人员一眼看到下一步
+  const [dstat, setDstat] = useState<Record<string, any>>({})
+  useEffect(() => {
+    let alive = true
+    const loadD = async () => {
+      const entries = await Promise.all(projects.map(async p => {
+        try {
+          const d = await api.get<any>(`/api/projects/${p.id}/deliverable-status`)
+          return [p.id, d] as const
+        } catch { return [p.id, undefined] as const }
+      }))
+      if (alive) setDstat(Object.fromEntries(entries))
+    }
+    if (projects.length) loadD()
+    const t = setInterval(loadD, 10000)
+    return () => { alive = false; clearInterval(t) }
+  }, [projects])
 
   const shown = projects.filter(p => !q || p.name.toLowerCase().includes(q.toLowerCase()))
   const kpi = {
@@ -80,18 +98,34 @@ export default function Projects() {
     <div className="project-wall">
       {shown.map(p => {
         const pct = prog[p.id]?.percent ?? 0
+        const d = dstat[p.id]
         return (
           <Link key={p.id} to={`/projects/${p.id}`} className="project-tile">
             <div className="tile-top">
               <span className="tile-name">{p.name}</span>
               <span className={`dot ${p.status}`} />
             </div>
+            {d && (
+              <div style={{ fontSize: 12.5, margin: '6px 0' }}>
+                {d.deliverable
+                  ? <span className="badge completed">✅ 可交付</span>
+                  : <span className="badge">{d.next_action}</span>}
+              </div>
+            )}
             <div className="tile-meta">
               <span>{STATUS_ZH[p.status] || p.status}</span>
               <span>→ {String(p.target_lang || 'en').toUpperCase()}</span>
+              {d && <span style={{ fontFamily: 'var(--mono)' }}>配音 {d.generated}/{d.total}</span>}
               <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)' }}>{pct}%</span>
             </div>
             <div className="tile-bar"><div style={{ width: `${pct}%` }} /></div>
+            {d && (d.missing > 0 || d.over_limit > 0 || d.over_slot > 0) && (
+              <div style={{ fontSize: 11.5, color: 'var(--warn, #e8b339)', marginTop: 4 }}>
+                {d.missing > 0 && <span>缺音频 {d.missing}　</span>}
+                {d.over_limit > 0 && <span>超长 {d.over_limit}　</span>}
+                {d.over_slot > 0 && <span>超窗 {d.over_slot}</span>}
+              </div>
+            )}
           </Link>
         )
       })}

@@ -178,8 +178,26 @@ export default function ProjectDetail() {
               <div className="cast-name">{spk.role_name || spk.label}</div>
               <div className="dim" style={{ fontSize: 12 }}>{spk.utts} 句</div>
               <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-                <button className="btn ghost sm"><IcPlay />试听</button>
-                <button className="btn ghost sm">音色</button>
+                <button className="btn ghost sm" onClick={() => {
+                  // 抽该角色第一句有音频的台词播放（0906审计P2：试听落地）
+                  api.get<any[]>(`/api/projects/${id}/utterances`).then(async (uts: any[]) => {
+                    const mine = uts.filter((u: any) => u.speaker_id === spk.id).slice(0, 20)
+                    for (const u of mine) {
+                      try {
+                        const r = await fetch(`/api/projects/${id}/mode-b/clip/${u.uid}`)
+                        if (r.ok) {
+                          new Audio(URL.createObjectURL(await r.blob())).play()
+                          return
+                        }
+                      } catch { /* 试下一句 */ }
+                    }
+                    alert('该角色暂无已生成的配音音频')
+                  })
+                }}><IcPlay />试听</button>
+                <button className="btn ghost sm" onClick={() => {
+                  navigator.clipboard?.writeText(spk.id)
+                  alert(`角色ID已复制：${spk.id}\n（批量改音色：修改 ref_audio_pool 后重跑 tts-batch）`)
+                }}>音色</button>
               </div>
             </div>
           ))}

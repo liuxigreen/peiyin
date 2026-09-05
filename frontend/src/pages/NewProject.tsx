@@ -47,7 +47,7 @@ export default function NewProject() {
           if (!up.ok) throw new Error(`音频上传失败 ${up.status}`)
         }
         const run = await api.post<{ ok: boolean; error?: string }>(`/api/projects/${pid}/mode-b/run`)
-        if (!run.ok) throw new Error(run.error || '模式B流程失败')
+        if (!run.ok) throw new Error(run.error || '流程失败')
         nav(`/projects/${pid}`)
       } else {
         if (videoFile) {
@@ -84,15 +84,15 @@ export default function NewProject() {
     <div className="mode-cards">
       <div className={'card' + (mode === 'B' ? ' sel' : '')} onClick={() => !busy && setMode('B')}>
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <IcMic />模式B · 字幕+配音 <span className="badge completed">推荐</span>
+          <IcMic />生成配音素材 <span className="badge completed">推荐</span>
         </h3>
         <p className="dim" style={{ marginTop: 6, fontSize: 12.5 }}>
-          上传中文字幕 SRT + 中文配音音频 → 翻译出外语字幕 + 分句外语配音交付包。无需视频，交付快。
+          上传字幕（可选加配音音频/已有翻译）→ 得到外语字幕和分角色配音，进剪映合成。交付快。
         </p>
       </div>
       <div className={'card' + (mode === 'A' ? ' sel' : '')} onClick={() => !busy && setMode('A')}>
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <IcFilm />模式A · 完整流程
+          <IcFilm />生成完整视频
         </h3>
         <p className="dim" style={{ marginTop: 6, fontSize: 12.5 }}>
           上传视频母片走全流程 → 直接出配音成片视频。GPU 环节接入中，当前先登记素材。

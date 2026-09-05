@@ -1,5 +1,7 @@
+import { useState, useEffect } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { IcFolder, IcMic, IcSliders, IcCpu } from './Icons'
+import { api } from '../api/client'
 
 function CrumbFromPath() {
   const loc = useLocation()
@@ -39,11 +41,37 @@ export default function Layout() {
         <header className="topbar">
           <div className="crumbs"><CrumbFromPath /></div>
           <div className="spacer" />
-          <span className="env-chip"><span className="dot" />PROD · 云端在线</span>
+          <HealthChip />
         </header>
         <main className="main"><Outlet /></main>
       </div>
     </div>
+  )
+}
+
+// 0906审计P4：真实健康状态（轮询后端），替换写死的"PROD · 云端在线"
+function HealthChip() {
+  const [st, setSt] = useState<'ok' | 'down' | 'checking'>('checking')
+  useEffect(() => {
+    let alive = true
+    const ping = async () => {
+      try {
+        await api.get('/api/projects')
+        if (alive) setSt('ok')
+      } catch {
+        if (alive) setSt('down')
+      }
+    }
+    ping()
+    const t = setInterval(ping, 15000)
+    return () => { alive = false; clearInterval(t) }
+  }, [])
+  const label = st === 'ok' ? '运行中 · 已连接' : st === 'down' ? '连接失败 · 重试中' : '检查连接…'
+  const cls = st === 'ok' ? 'ok' : st === 'down' ? 'bad' : ''
+  return (
+    <span className="env-chip" title={st === 'down' ? '控制面不可达：检查 peiyin 服务' : ''}>
+      <span className={`dot ${cls}`} />{label}
+    </span>
   )
 }
 
