@@ -821,3 +821,21 @@ def utterance_retake(pid: str, uid: str, body: dict,
                   ("engine", "engine_url", "rate") if body.get(k)}
     batch_body["uids"] = [uid]
     return create_tts_batch(pid, batch_body, db)
+
+
+@router.get("/projects/{pid}/mode-b/clip/{uid}")
+def get_clip_audio(pid: str, uid: str, db: Session = Depends(get_db)):
+    """单句试听：返回该uid最新配音wav（0906审计P2：听改闭环）。"""
+    import os as _os
+    from fastapi.responses import FileResponse
+    from ..db.models import TtsClip
+    u = db.query(Utterance).filter_by(project_id=pid, uid=uid).first()
+    if not u:
+        raise HTTPException(404, "utterance not found")
+    cl = (db.query(TtsClip)
+            .filter_by(utterance_id=u.id, status="completed")
+            .order_by(TtsClip.version.desc()).first())
+    if not cl or not cl.audio_r2_key or not _os.path.exists(cl.audio_r2_key):
+        raise HTTPException(404, "clip audio not ready")
+    return FileResponse(cl.audio_r2_key, media_type="audio/wav",
+                        filename=f"{uid}.wav")

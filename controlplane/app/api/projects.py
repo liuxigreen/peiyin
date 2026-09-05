@@ -1,5 +1,6 @@
 """项目/切片/台词/翻译 CRUD"""
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from sqlalchemy import func as _func
 from sqlalchemy.orm import Session
 from ..db.session import get_db
 from ..db import models as m
@@ -30,6 +31,11 @@ def project_detail(pid: str, db: Session = Depends(get_db)):
     if not p: raise HTTPException(404)
     segs = db.query(m.Segment).filter_by(project_id=pid).order_by(m.Segment.seg_index).all()
     spks = db.query(m.Speaker).filter_by(project_id=pid).all()
+    # utterance_count历史未维护——实时统计绑定数（0906审计：角色卡句数全0）
+    _cnt = dict(db.query(m.Utterance.speaker_id, _func.count(m.Utterance.id))
+                .filter(m.Utterance.project_id == pid,
+                        m.Utterance.speaker_id.isnot(None))
+                .group_by(m.Utterance.speaker_id).all())
     tasks = db.query(m.PipelineTask).filter_by(project_id=pid).count()
     return {"id": p.id, "name": p.name, "status": p.status,
             "target_lang": p.target_lang, "total_tasks": tasks,
@@ -37,7 +43,7 @@ def project_detail(pid: str, db: Session = Depends(get_db)):
                           "range": f"{s.start_ms//1000}-{s.end_ms//1000}s",
                           "status": s.status} for s in segs],
             "speakers": [{"id": s.id, "label": s.label, "role_name": s.role_name,
-                          "utts": s.utterance_count} for s in spks]}
+                          "utts": _cnt.get(s.id, s.utterance_count or 0)} for s in spks]}
 
 @router.patch("/{pid}/speakers/{sid}")
 def rename_speaker(pid: str, sid: str, body: dict, db: Session = Depends(get_db)):
