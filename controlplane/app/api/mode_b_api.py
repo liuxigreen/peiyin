@@ -434,7 +434,7 @@ def create_diarize_task(pid: str, body: dict, db: Session = Depends(get_db)):
         resource="gpu", gpu_required=True, weight=5, depends_on=[],
         input_hash=f"diarize:{pid}:{ts}", status="pending",
         output_paths={"payload": {
-            "project_id": pid, "zh_audio_url": f"/api/nodes/voices/{vid}.mp3",
+            "project_id": pid, "zh_audio_url": f"/api/nodes/voices/zhaudio/{vid}.mp3",
             "srt_slots": slots}})
     db.add(t)
     db.commit()
@@ -728,3 +728,96 @@ def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
              "lines": manifest}, ensure_ascii=False, indent=1))
     return {"ok": True, "voices": sorted(seen), "lines": len(manifest),
             "download": f"/api/projects/{pid}/mode-b/file/audition/audition.zip"}
+
+
+@router.get("/projects/{pid}/deliverable-status")
+def deliverable_status(pid: str, db: Session = Depends(get_db)):
+    """可交付状态聚合（0906审计P1）：制作人员一眼看到下一步。
+    生成≠可交付：超限/超窗/缺音频分开计数。"""
+    from ..db.models import TtsClip
+    from ..translate_executor import is_placeholder
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    utts = (db.query(Utterance).filter_by(project_id=pid)
+              .order_by(Utterance.seq_index).all())
+    utt_ids = {u.id: u for u in utts}
+    latest = {}
+    for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
+              .order_by(Translation.version).all()):
+        if is_placeholder(t.text or ""):
+            continue
+        latest[t.utterance_id] = t
+    clips = {}
+    for cl in (db.query(TtsClip).join(Utterance, TtsClip.utterance_id == Utterance.id)
+               .filter(Utterance.project_id == pid,
+                       TtsClip.status == "completed")
+               .order_by(TtsClip.version.desc()).all()):
+        clips.setdefault(cl.utterance_id, cl)          # 最高version
+    n_total = len(utts)
+    n_translated = sum(1 for u in utts if u.id in latest)
+    n_overlimit = sum(1 for u in utts
+                      if u.id in latest and latest[u.id].is_over_limit)
+    n_generated = len(clips)
+    n_missing = sum(1 for u in utts
+                    if u.id in latest and u.id not in clips)
+    n_overslot = 0
+    for u in utts:
+        cl = clips.get(u.id)
+        if cl and (u.end_ms or 0) > (u.start_ms or 0):
+            win = (u.end_ms or 0) - (u.start_ms or 0)
+            if cl.duration_ms and cl.duration_ms > win * 1.15:
+                n_overslot += 1
+    # 可交付判定：全部有音频 且 无超限 且 超窗≤5%
+    deliverable = (n_missing == 0 and n_overlimit == 0
+                   and n_total > 0 and n_overslot <= n_total * 0.05)
+    if n_missing:
+        action = f"补配 {n_missing} 句缺失音频"
+    elif n_overlimit:
+        action = f"压缩重译 {n_overlimit} 句超长译文"
+    elif n_overslot:
+        action = f"试听检查 {n_overslot} 句超窗台词"
+    elif deliverable:
+        action = "可打包交付"
+    else:
+        action = "生成配音"
+    return {
+        "total": n_total, "translated": n_translated,
+        "generated": n_generated, "missing": n_missing,
+        "over_limit": n_overlimit, "over_slot": n_overslot,
+        "deliverable": deliverable, "next_action": action,
+    }
+
+
+@router.post("/projects/{pid}/utterances/{uid}/retake")
+def utterance_retake(pid: str, uid: str, body: dict,
+                     db: Session = Depends(get_db)):
+    """单句返工（0906审计P2：听→改→重做闭环）。
+    可同时改译文(text)与情绪(emotion)；音色/参数沿用批次配置。
+    幂等：input_hash 去重，同参数不会重复合成。"""
+    import uuid as _uuid
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    u = db.query(Utterance).filter_by(project_id=pid, uid=uid).first()
+    if not u:
+        raise HTTPException(404, "utterance not found")
+    tr = (db.query(Translation)
+            .filter_by(utterance_id=u.id, target_lang=p.target_lang)
+            .order_by(Translation.version.desc()).first())
+    text = (body.get("text") or "").strip()
+    if text and text != (tr.text if tr else ""):
+        db.add(Translation(id=_uuid.uuid4().hex, utterance_id=u.id,
+                           target_lang=p.target_lang,
+                           version=(tr.version + 1) if tr else 1,
+                           text=text, llm_model="manual-edit",
+                           is_approved=True))
+    emo = body.get("emotion")
+    if emo is not None:
+        u.emotion_label = (emo or "").strip() or None
+    db.commit()
+    # 单句重合成：复用tts-batch的单句语义（scene=SCxx, uids=[uid]）
+    batch_body = {k: body[k] for k in
+                  ("engine", "engine_url", "rate") if body.get(k)}
+    batch_body["uids"] = [uid]
+    return create_tts_batch(pid, batch_body, db)
