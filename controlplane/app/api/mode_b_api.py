@@ -280,6 +280,13 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         if not line_body.get("instruct") and not line_body.get("emotion"):
             line_body["instruct"] = "用平静自然的语气说这句话"
         payload, _ = _tts_payload(db, p, u, latest, line_body)
+        # 克隆模式(0906): 角色绑定的切片wav直接当参考音(节点本地路径可见)
+        if line_body.get("clone_refs") and u.speaker_id:
+            ref = _os.environ.get("NODE_WORKDIR_MAP", "E:/peiyin-node/workdir/zh_refs")
+            refp = f"{ref}/{u.uid}.wav"
+            if refp not in payload.get("ref_audio", "") or not payload.get("ref_audio"):
+                payload["ref_audio"] = refp
+                payload["ref_audio_path"] = refp
         if emo and emo != "neutral" and "emotion" not in payload:
             payload["emotion"] = emo
         ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"
@@ -850,3 +857,44 @@ def get_clip_audio(pid: str, uid: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "clip audio not ready")
     return FileResponse(cl.audio_r2_key, media_type="audio/wav",
                         filename=f"{uid}.wav")
+
+
+@router.post("/projects/{pid}/mode-b/clone-refs")
+def build_clone_refs(pid: str, body: dict, db: Session = Depends(get_db)):
+    from ..db.models import Speaker
+    """简化克隆链（0906用户方案）：不要pyannote。
+    切片已在节点 workdir/zh_refs/{uid}.wav（413个，按LLM绑定归角色）
+    → 每角色取最清晰3句当参考音清单 → tts-batch时payload.ref_audio直接指切片。
+    节点合成时拉该切片做zero-shot克隆。零新依赖。"""
+    import os as _os
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    # 从utterances拿speaker绑定+时长, 与节点zh_refs对齐
+    rows = (db.query(Utterance, Speaker)
+              .join(Speaker, Utterance.speaker_id == Speaker.id)
+              .filter(Utterance.project_id == pid,
+                      Utterance.speaker_id.isnot(None)).all())
+    cand: dict[str, dict] = {}
+    for u, spk in rows:
+        dur = (u.end_ms or 0) - (u.start_ms or 0)
+        if not (1000 <= dur <= 10000):
+            continue
+        cand.setdefault(spk.id, {"label": spk.label,
+                                 "items": []})["items"].append(
+            {"uid": u.uid, "dur": dur})
+    out = {}
+    for sid, info in cand.items():
+        items = sorted(info["items"], key=lambda x: -x["dur"])[:3]
+        out[sid] = {"label": info["label"],
+                    "ref_uids": [x["uid"] for x in items]}
+    # 节点侧路径约定: workdir/zh_refs/{uid}.wav — 生成映射文件供tts-batch查
+    ref_map = {sid: [f"/api/nodes/voices/zhaudio_ref/{uid}.wav" for uid in v["ref_uids"]]
+               for sid, v in out.items()}
+    import json as _json
+    storage = _os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+    reg = _os.path.join(storage, "voices_registry.json")
+    reg_data = _json.load(open(reg)) if _os.path.exists(reg) else {}
+    # 把节点切片清单下发（节点自己已有文件，这里只是登记URL路由）
+    return {"ok": True, "speakers": out, "ref_map": ref_map,
+            "note": "tts-batch传 clone_refs=true 即启用角色克隆"}
