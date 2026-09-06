@@ -64,6 +64,14 @@ export default function ProjectDetail() {
     try { setPkg(await api.get(`/api/projects/${id}/mode-b/package`)) }
     catch { setPkgMsg('交付包尚未生成（翻译/配音完成后可下载）') }
   }
+  async function makeAudition() {
+    setPkgMsg('生成试听包中…')
+    try {
+      const r = await api.post<any>(`/api/projects/${id}/mode-b/audition-pack`, { per_voice: 2 })
+      window.open(`/api/projects/${id}/mode-b/file/audition/audition.zip`)
+      setPkgMsg(`试听包已生成：${r.voices.length} 个音色 / ${r.lines} 句`)
+    } catch (e: any) { setPkgMsg('试听包生成失败：' + (e.message || e)) }
+  }
 
   if (!proj) return <div className="dim" style={{ padding: 40 }}>加载中…</div>
   const phases = prog?.phases
@@ -90,6 +98,7 @@ export default function ProjectDetail() {
       </div>
       <div className="page-actions">
         <button className="btn ghost" onClick={checkPkg}><IcDownload />检查交付包</button>
+          <button className="btn ghost" onClick={makeAudition}><IcPlay />生成试听包</button>
         {pkg && <a className="btn" href={pkg.download_url}><IcDownload />下载交付包</a>}
       </div>
     </div>
