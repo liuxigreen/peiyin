@@ -274,7 +274,11 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         emo = (getattr(u, "emotion_label", "") or "").strip()
         # P0修复(0905审计)：必须每句独立line_body——此前body={**body,...}污染
         # 循环外层，上一句的emotion会串到后续neutral句（情绪串台）
+        # P0(0906鬼手对比复盘): 无情绪也必须带instruct——CV3无文本条件时
+        # 对中文参考音塌缩(0.5s垃圾),v1根因。instruct2模式=全自动化关键
         line_body = {**body, "emotion": emo} if (emo and emo != "neutral") else dict(body)
+        if not line_body.get("instruct") and not line_body.get("emotion"):
+            line_body["instruct"] = "用平静自然的语气说这句话"
         payload, _ = _tts_payload(db, p, u, latest, line_body)
         if emo and emo != "neutral" and "emotion" not in payload:
             payload["emotion"] = emo
@@ -434,7 +438,7 @@ def create_diarize_task(pid: str, body: dict, db: Session = Depends(get_db)):
         resource="gpu", gpu_required=True, weight=5, depends_on=[],
         input_hash=f"diarize:{pid}:{ts}", status="pending",
         output_paths={"payload": {
-            "project_id": pid, "zh_audio_url": f"/api/nodes/voices/{vid}.mp3",
+            "project_id": pid, "zh_audio_url": f"/api/nodes/voices/zhaudio/{vid}.mp3",
             "srt_slots": slots}})
     db.add(t)
     db.commit()
@@ -456,20 +460,21 @@ async def bind_speakers_ep(pid: str, body: dict = None, db: Session = Depends(ge
     return {"ok": True, **r}
 
 
-@router.get("/projects/{pid}/mode-b/file/{name}")
+@router.get("/projects/{pid}/mode-b/file/{name:path}")
 def download_work_file(pid: str, name: str):
     """下载 MODE_B_STORAGE/{pid8}/ 下的工作文件（A/B试听包等）。
-    文件名白名单防目录穿越。"""
+    支持子路径（如 audition/audition.zip）；拒绝..穿越。"""
     import os as _os
-    import re as _re
     from fastapi.responses import FileResponse
-    if not _re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
-        raise HTTPException(400, "bad filename")
+    if ".." in name or name.startswith("/"):
+        raise HTTPException(400, "bad path")
     storage = _os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
-    path = _os.path.join(storage, pid[:8], name)
+    path = _os.path.normpath(_os.path.join(storage, pid[:8], name))
+    if not path.startswith(_os.path.join(storage, pid[:8])):
+        raise HTTPException(400, "bad path")
     if not _os.path.isfile(path):
         raise HTTPException(404, "file not found")
-    return FileResponse(path, filename=name)
+    return FileResponse(path, filename=_os.path.basename(name))
 
 
 @router.post("/projects/{pid}/mode-b/tts-requeue")
@@ -702,7 +707,7 @@ def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
             PipelineTask.project_id == pid,
             PipelineTask.task_type == "tts-generate",
             PipelineTask.status == "completed").all():
-        pay = (json.loads(op) if isinstance(op, str) else (op or {})).get("payload", {})
+        pay = (__json.loads(op) if isinstance(op, str) else (op or {})).get("payload", {})
         if pay.get("uid"):
             voice_of[pay["uid"]] = pay.get("voice_id") or "unknown"
     seen = {}
@@ -710,6 +715,12 @@ def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
     for clip, u in rows:
         v = voice_of.get(u.uid, "unknown")
         seen.setdefault(v, 0)
+        # 跳过塌缩句(<0.35s/词 或 duration<250ms)——试听包要给用户听正常样本
+        if clip.duration_ms and clip.duration_ms < 250:
+            continue
+        win = max((u.end_ms or 0) - (u.start_ms or 0), 1)
+        if clip.duration_ms and clip.duration_ms < win * 0.25:
+            continue
         if seen[v] < per_voice:
             seen[v] += 1
             picked.append((clip, u, v))
@@ -723,8 +734,119 @@ def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
                                  "uid": u.uid, "voice": v,
                                  "en": (tr.text if tr else "")[:80],
                                  "zh": (u.original_text or "")[:40]})
-        z.writestr("manifest.json", json.dumps(
+        z.writestr("manifest.json", _json.dumps(
             {"project": p.name, "voices": sorted(seen),
              "lines": manifest}, ensure_ascii=False, indent=1))
     return {"ok": True, "voices": sorted(seen), "lines": len(manifest),
             "download": f"/api/projects/{pid}/mode-b/file/audition/audition.zip"}
+
+
+@router.get("/projects/{pid}/deliverable-status")
+def deliverable_status(pid: str, db: Session = Depends(get_db)):
+    """可交付状态聚合（0906审计P1）：制作人员一眼看到下一步。
+    生成≠可交付：超限/超窗/缺音频分开计数。"""
+    from ..db.models import TtsClip
+    from ..translate_executor import is_placeholder
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    utts = (db.query(Utterance).filter_by(project_id=pid)
+              .order_by(Utterance.seq_index).all())
+    utt_ids = {u.id: u for u in utts}
+    latest = {}
+    for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
+              .order_by(Translation.version).all()):
+        if is_placeholder(t.text or ""):
+            continue
+        latest[t.utterance_id] = t
+    clips = {}
+    for cl in (db.query(TtsClip).join(Utterance, TtsClip.utterance_id == Utterance.id)
+               .filter(Utterance.project_id == pid,
+                       TtsClip.status == "completed")
+               .order_by(TtsClip.version.desc()).all()):
+        clips.setdefault(cl.utterance_id, cl)          # 最高version
+    n_total = len(utts)
+    n_translated = sum(1 for u in utts if u.id in latest)
+    n_overlimit = sum(1 for u in utts
+                      if u.id in latest and latest[u.id].is_over_limit)
+    n_generated = len(clips)
+    n_missing = sum(1 for u in utts
+                    if u.id in latest and u.id not in clips)
+    n_overslot = 0
+    for u in utts:
+        cl = clips.get(u.id)
+        if cl and (u.end_ms or 0) > (u.start_ms or 0):
+            win = (u.end_ms or 0) - (u.start_ms or 0)
+            if cl.duration_ms and cl.duration_ms > win * 1.15:
+                n_overslot += 1
+    # 可交付判定：全部有音频 且 无超限 且 超窗≤5%
+    deliverable = (n_missing == 0 and n_overlimit == 0
+                   and n_total > 0 and n_overslot <= n_total * 0.05)
+    if n_missing:
+        action = f"补配 {n_missing} 句缺失音频"
+    elif n_overlimit:
+        action = f"压缩重译 {n_overlimit} 句超长译文"
+    elif n_overslot:
+        action = f"试听检查 {n_overslot} 句超窗台词"
+    elif deliverable:
+        action = "可打包交付"
+    else:
+        action = "生成配音"
+    return {
+        "total": n_total, "translated": n_translated,
+        "generated": n_generated, "missing": n_missing,
+        "over_limit": n_overlimit, "over_slot": n_overslot,
+        "deliverable": deliverable, "next_action": action,
+    }
+
+
+@router.post("/projects/{pid}/utterances/{uid}/retake")
+def utterance_retake(pid: str, uid: str, body: dict,
+                     db: Session = Depends(get_db)):
+    """单句返工（0906审计P2：听→改→重做闭环）。
+    可同时改译文(text)与情绪(emotion)；音色/参数沿用批次配置。
+    幂等：input_hash 去重，同参数不会重复合成。"""
+    import uuid as _uuid
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    u = db.query(Utterance).filter_by(project_id=pid, uid=uid).first()
+    if not u:
+        raise HTTPException(404, "utterance not found")
+    tr = (db.query(Translation)
+            .filter_by(utterance_id=u.id, target_lang=p.target_lang)
+            .order_by(Translation.version.desc()).first())
+    text = (body.get("text") or "").strip()
+    if text and text != (tr.text if tr else ""):
+        db.add(Translation(id=_uuid.uuid4().hex, utterance_id=u.id,
+                           target_lang=p.target_lang,
+                           version=(tr.version + 1) if tr else 1,
+                           text=text, llm_model="manual-edit",
+                           is_approved=True))
+    emo = body.get("emotion")
+    if emo is not None:
+        u.emotion_label = (emo or "").strip() or None
+    db.commit()
+    # 单句重合成：复用tts-batch的单句语义（scene=SCxx, uids=[uid]）
+    batch_body = {k: body[k] for k in
+                  ("engine", "engine_url", "rate") if body.get(k)}
+    batch_body["uids"] = [uid]
+    return create_tts_batch(pid, batch_body, db)
+
+
+@router.get("/projects/{pid}/mode-b/clip/{uid}")
+def get_clip_audio(pid: str, uid: str, db: Session = Depends(get_db)):
+    """单句试听：返回该uid最新配音wav（0906审计P2：听改闭环）。"""
+    import os as _os
+    from fastapi.responses import FileResponse
+    from ..db.models import TtsClip
+    u = db.query(Utterance).filter_by(project_id=pid, uid=uid).first()
+    if not u:
+        raise HTTPException(404, "utterance not found")
+    cl = (db.query(TtsClip)
+            .filter_by(utterance_id=u.id, status="completed")
+            .order_by(TtsClip.version.desc()).first())
+    if not cl or not cl.audio_r2_key or not _os.path.exists(cl.audio_r2_key):
+        raise HTTPException(404, "clip audio not ready")
+    return FileResponse(cl.audio_r2_key, media_type="audio/wav",
+                        filename=f"{uid}.wav")
