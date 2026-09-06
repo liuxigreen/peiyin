@@ -274,7 +274,11 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         emo = (getattr(u, "emotion_label", "") or "").strip()
         # P0修复(0905审计)：必须每句独立line_body——此前body={**body,...}污染
         # 循环外层，上一句的emotion会串到后续neutral句（情绪串台）
+        # P0(0906鬼手对比复盘): 无情绪也必须带instruct——CV3无文本条件时
+        # 对中文参考音塌缩(0.5s垃圾),v1根因。instruct2模式=全自动化关键
         line_body = {**body, "emotion": emo} if (emo and emo != "neutral") else dict(body)
+        if not line_body.get("instruct") and not line_body.get("emotion"):
+            line_body["instruct"] = "用平静自然的语气说这句话"
         payload, _ = _tts_payload(db, p, u, latest, line_body)
         if emo and emo != "neutral" and "emotion" not in payload:
             payload["emotion"] = emo
@@ -456,20 +460,21 @@ async def bind_speakers_ep(pid: str, body: dict = None, db: Session = Depends(ge
     return {"ok": True, **r}
 
 
-@router.get("/projects/{pid}/mode-b/file/{name}")
+@router.get("/projects/{pid}/mode-b/file/{name:path}")
 def download_work_file(pid: str, name: str):
     """下载 MODE_B_STORAGE/{pid8}/ 下的工作文件（A/B试听包等）。
-    文件名白名单防目录穿越。"""
+    支持子路径（如 audition/audition.zip）；拒绝..穿越。"""
     import os as _os
-    import re as _re
     from fastapi.responses import FileResponse
-    if not _re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
-        raise HTTPException(400, "bad filename")
+    if ".." in name or name.startswith("/"):
+        raise HTTPException(400, "bad path")
     storage = _os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
-    path = _os.path.join(storage, pid[:8], name)
+    path = _os.path.normpath(_os.path.join(storage, pid[:8], name))
+    if not path.startswith(_os.path.join(storage, pid[:8])):
+        raise HTTPException(400, "bad path")
     if not _os.path.isfile(path):
         raise HTTPException(404, "file not found")
-    return FileResponse(path, filename=name)
+    return FileResponse(path, filename=_os.path.basename(name))
 
 
 @router.post("/projects/{pid}/mode-b/tts-requeue")
@@ -702,7 +707,7 @@ def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
             PipelineTask.project_id == pid,
             PipelineTask.task_type == "tts-generate",
             PipelineTask.status == "completed").all():
-        pay = (json.loads(op) if isinstance(op, str) else (op or {})).get("payload", {})
+        pay = (__json.loads(op) if isinstance(op, str) else (op or {})).get("payload", {})
         if pay.get("uid"):
             voice_of[pay["uid"]] = pay.get("voice_id") or "unknown"
     seen = {}
@@ -710,6 +715,12 @@ def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
     for clip, u in rows:
         v = voice_of.get(u.uid, "unknown")
         seen.setdefault(v, 0)
+        # 跳过塌缩句(<0.35s/词 或 duration<250ms)——试听包要给用户听正常样本
+        if clip.duration_ms and clip.duration_ms < 250:
+            continue
+        win = max((u.end_ms or 0) - (u.start_ms or 0), 1)
+        if clip.duration_ms and clip.duration_ms < win * 0.25:
+            continue
         if seen[v] < per_voice:
             seen[v] += 1
             picked.append((clip, u, v))
@@ -723,7 +734,7 @@ def audition_pack(pid: str, body: dict, db: Session = Depends(get_db)):
                                  "uid": u.uid, "voice": v,
                                  "en": (tr.text if tr else "")[:80],
                                  "zh": (u.original_text or "")[:40]})
-        z.writestr("manifest.json", json.dumps(
+        z.writestr("manifest.json", _json.dumps(
             {"project": p.name, "voices": sorted(seen),
              "lines": manifest}, ensure_ascii=False, indent=1))
     return {"ok": True, "voices": sorted(seen), "lines": len(manifest),
