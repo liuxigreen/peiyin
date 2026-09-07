@@ -1,6 +1,10 @@
 """模式B API：无视频流程（字幕+中文配音 → 交付包）"""
 from __future__ import annotations
 
+import datetime as _dt
+import errno as _errno
+import fcntl as _fcntl
+import hashlib as _hashlib
 import json as _json
 import os
 
@@ -17,6 +21,46 @@ router = APIRouter(prefix="/api", tags=["mode-b"])
 STORAGE = os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
 
 
+def _mode_b_fingerprint(audio_path: str | None, target_lang: str,
+                        entries: list[dict]) -> str:
+    """Stable identity for an audio/time-axis/language Mode-B run."""
+    audio = None
+    if audio_path:
+        try:
+            stat = os.stat(audio_path)
+            audio = {"path": audio_path, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        except OSError:
+            audio = {"path": audio_path, "size": None, "mtime_ns": None}
+    payload = {"audio": audio, "target_lang": target_lang,
+               "entries": [[e.get("uid"), e["start_ms"], e["end_ms"]] for e in entries]}
+    return _hashlib.sha256(_json.dumps(payload, ensure_ascii=False,
+                                       sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _acquire_mode_b_lock(work: str) -> int:
+    os.makedirs(work, exist_ok=True)
+    fd = os.open(os.path.join(work, ".mode-b-run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (_errno.EAGAIN, _errno.EACCES):
+            raise HTTPException(409, "mode-b run already in progress") from exc
+        raise
+    return fd
+
+
+def _release_mode_b_lock(fd: int) -> None:
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _mode_b_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
 @router.post("/projects/{pid}/mode-b/upload-audio")
 async def upload_audio_info(pid: str, body: dict, db: Session = Depends(get_db)):
     """登记中文配音音频（本地路径或R2 key）。body: {audio_path} 
@@ -28,6 +72,7 @@ async def upload_audio_info(pid: str, body: dict, db: Session = Depends(get_db))
         raise HTTPException(400, f"audio file not found: {body.get('audio_path')}")
     cfg = dict(p.config or {})
     cfg["mode_b_audio"] = body["audio_path"]
+    cfg.pop("mode_b_run", None)
     p.config = cfg
     db.commit()
     return {"ok": True}
@@ -45,82 +90,134 @@ async def upload_audio_file(pid: str, file: UploadFile = File(...),
     os.makedirs(dest_dir, exist_ok=True)
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
     dest = os.path.join(dest_dir, f"zh_audio{suffix}")
-    with open(dest, "wb") as f:
-        f.write(await file.read())
+    try:
+        # Stream multipart uploads in bounded chunks; browser audio can be large.
+        with open(dest, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    finally:
+        await file.close()
     cfg = dict(p.config or {})
     cfg["mode_b_audio"] = dest
+    cfg.pop("mode_b_run", None)
     p.config = cfg
     db.commit()
     return {"ok": True, "path": dest, "size": os.path.getsize(dest)}
 
 
 @router.post("/projects/{pid}/mode-b/run")
-async def run_mode_b(pid: str, db: Session = Depends(get_db)):
+async def run_mode_b(pid: str, body: dict | None = None, db: Session = Depends(get_db)):
     """模式B主流程：B2槽位→B3翻译→B4 TTS(降级)→B5 fit→B6交付包。
     前置：seed-srt已跑、mode_b_audio已登记、provider已配置。"""
     p = db.get(Project, pid)
     if not p:
         raise HTTPException(404)
-    audio_path = (p.config or {}).get("mode_b_audio")
-    has_audio = bool(audio_path and os.path.exists(audio_path))
-    cfg0 = dict(p.config or {})
-    cfg0["mode"] = "B"
-    p.config = cfg0
-    db.commit()
-    utts = (db.query(Utterance).filter_by(project_id=pid)
-              .order_by(Utterance.seq_index).all())
-    if not utts:
-        raise HTTPException(400, "先seed-srt导入中文字幕")
     os.makedirs(STORAGE, exist_ok=True)
     work = os.path.join(STORAGE, pid[:8])
     out_dir = os.path.join(work, "package")
-    os.makedirs(out_dir, exist_ok=True)
+    lock_fd = _acquire_mode_b_lock(work)
+    try:
+        db.refresh(p)
+        audio_path = (p.config or {}).get("mode_b_audio")
+        has_audio = bool(audio_path and os.path.exists(audio_path))
+        utts = (db.query(Utterance).filter_by(project_id=pid)
+                  .order_by(Utterance.seq_index).all())
+        if not utts:
+            raise HTTPException(400, "先seed-srt导入中文字幕")
+        entries = [{"uid": u.uid, "start_ms": u.start_ms, "end_ms": u.end_ms}
+                   for u in utts]
+        scenes = sorted({(u.uid or "SC01").split("-")[0] for u in utts})
+        fingerprint = _mode_b_fingerprint(audio_path, p.target_lang, entries)
+        prior = (p.config or {}).get("mode_b_run") or {}
+        package = prior.get("package")
+        force = bool((body or {}).get("force", False))
+        if (not force and prior.get("state") == "completed"
+                and prior.get("fingerprint") == fingerprint and package
+                and os.path.exists(package)):
+            return {"ok": True, "reused": True, "package": package,
+                    "clips": prior.get("clips", 0), "mode": "B"}
 
-    # B2 槽位（无音频时跳过——纯翻译模式）
-    entries = [{"uid": u.uid, "start_ms": u.start_ms, "end_ms": u.end_ms}
-               for u in utts]
-    slots = audio_slots(audio_path, entries, os.path.join(work, "zh_refs")) if has_audio else []
-    # B3 翻译（五步链，live provider；含语种校验兜底）
-    scenes = sorted({(u.uid or "SC01").split("-")[0] for u in utts})
-    # 上传翻译直连：已有非占位译文的场景跳过LLM（不烧网关配额）
-    from ..translate_executor import is_placeholder as _is_ph2
-    pre_latest = {}
-    for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
-              .order_by(Translation.version).all()):
-        if not _is_ph2(t.text or ""):
-            pre_latest[t.utterance_id] = t
-    tr_results = []
-    for sc in scenes:
-        sc_utts = [u for u in utts if (u.uid or "").startswith(sc + "-")]
-        if sc_utts and all(u.id in pre_latest for u in sc_utts):
-            tr_results.append({"scene": sc, "skipped": "already_translated"})
-            continue
-        info = await run_translate_scene(db, p, sc)
-        tr_results.append(info)
-    # 收集最新译文
-    from ..translate_executor import is_placeholder
-    latest: dict[str, Translation] = {}
-    for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
-                 .order_by(Translation.version).all()):
-        if is_placeholder(t.text or ""):
-            continue                     # 隔离句不进交付包（音频位空缺→补传/人工）
-        latest[t.utterance_id] = t
-    translations = {u.uid: (latest[u.id].text if u.id in latest else "")
-                    for u in utts}
-    # B4/B6：有音频才生成TTS与交付包；无音频=纯翻译模式（音频后补再run一次出包）
-    if has_audio:
-        fitted = tts_clips_mock(slots, p.target_lang, os.path.join(work, "dub"))
-        qc = {"syllable_over": sum(1 for r in tr_results for k in [r] if r.get("over_limit")),
-              "translations": len(translations),
-              "slots_out_of_audio": sum(1 for s in slots if not s["within_audio"])}
-        pkg = build_package({"id": pid, "name": p.name, "target_lang": p.target_lang},
-                            entries, translations, fitted, out_dir, qc)
-        return {"ok": True, "package": pkg, "clips": len(fitted),
-                "scenes_translated": len(tr_results), "mode": "B",
-                "translations": translations}
-    return {"ok": True, "mode": "B", "translations": translations,
-            "clips": 0, "note": "纯翻译完成；补传配音后再次run即可生成交付包",
-            "scenes_translated": len(tr_results)}
+        started_at = _mode_b_now()
+        cfg0 = dict(p.config or {})
+        cfg0["mode"] = "B"
+        cfg0["mode_b_run"] = {"state": "running", "fingerprint": fingerprint,
+                              "started_at": started_at, "package": package,
+                              "phase": "translate", "completed_scenes": 0,
+                              "total_scenes": len(scenes)}
+        p.config = cfg0
+        db.commit()
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            # B2 槽位（无音频时跳过——纯翻译模式）
+            slots = audio_slots(audio_path, entries, os.path.join(work, "zh_refs")) if has_audio else []
+            # B3 翻译（五步链，live provider；含语种校验兜底）
+            from ..translate_executor import is_placeholder as _is_ph2
+            pre_latest = {}
+            for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
+                      .order_by(Translation.version).all()):
+                if not _is_ph2(t.text or ""):
+                    pre_latest[t.utterance_id] = t
+            tr_results = []
+            for sc in scenes:
+                sc_utts = [u for u in utts if (u.uid or "").startswith(sc + "-")]
+                if sc_utts and all(u.id in pre_latest for u in sc_utts):
+                    tr_results.append({"scene": sc, "skipped": "already_translated"})
+                    continue
+                info = await run_translate_scene(db, p, sc)
+                tr_results.append(info)
+                db.refresh(p)
+                cfg_progress = dict(p.config or {})
+                run_progress = dict(cfg_progress.get("mode_b_run") or {})
+                run_progress.update({"state": "running", "phase": "translate",
+                                     "completed_scenes": len(tr_results),
+                                     "total_scenes": len(scenes)})
+                cfg_progress["mode_b_run"] = run_progress
+                p.config = cfg_progress
+                db.commit()
+            from ..translate_executor import is_placeholder
+            latest: dict[str, Translation] = {}
+            for t in (db.query(Translation).filter_by(target_lang=p.target_lang)
+                         .order_by(Translation.version).all()):
+                if not is_placeholder(t.text or ""):
+                    latest[t.utterance_id] = t
+            translations = {u.uid: (latest[u.id].text if u.id in latest else "")
+                            for u in utts}
+            result = {"ok": True, "mode": "B", "translations": translations,
+                      "clips": 0, "note": "纯翻译完成；补传配音后再次run即可生成交付包",
+                      "scenes_translated": len(tr_results)}
+            if has_audio:
+                fitted = tts_clips_mock(slots, p.target_lang, os.path.join(work, "dub"))
+                qc = {"syllable_over": sum(1 for r in tr_results if r.get("over_limit")),
+                      "translations": len(translations),
+                      "slots_out_of_audio": sum(1 for s in slots if not s["within_audio"])}
+                package = build_package({"id": pid, "name": p.name, "target_lang": p.target_lang},
+                                        entries, translations, fitted, out_dir, qc)
+                result.update(package=package, clips=len(fitted))
+            db.refresh(p)
+            cfg1 = dict(p.config or {})
+            cfg1["mode"] = "B"
+            cfg1["mode_b_run"] = {"state": "completed", "fingerprint": fingerprint,
+                                  "started_at": started_at, "completed_at": _mode_b_now(),
+                                  "package": package, "clips": result["clips"]}
+            p.config = cfg1
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            failed = db.get(Project, pid)
+            if failed:
+                cfg_failed = dict(failed.config or {})
+                cfg_failed["mode_b_run"] = {"state": "failed", "fingerprint": fingerprint,
+                                            "started_at": started_at, "failed_at": _mode_b_now(),
+                                            "package": package}
+                failed.config = cfg_failed
+                db.commit()
+            raise
+    finally:
+        _release_mode_b_lock(lock_fd)
 
 
 def _tts_payload(db: Session, p: Project, target_u: Utterance,
@@ -280,6 +377,13 @@ def create_tts_batch(pid: str, body: dict, db: Session = Depends(get_db)):
         if not line_body.get("instruct") and not line_body.get("emotion"):
             line_body["instruct"] = "用平静自然的语气说这句话"
         payload, _ = _tts_payload(db, p, u, latest, line_body)
+        # 克隆模式(0906): 角色绑定的切片wav直接当参考音(节点本地路径可见)
+        if line_body.get("clone_refs") and u.speaker_id:
+            ref = _os.environ.get("NODE_WORKDIR_MAP", "E:/peiyin-node/workdir/zh_refs")
+            refp = f"{ref}/{u.uid}.wav"
+            if refp not in payload.get("ref_audio", "") or not payload.get("ref_audio"):
+                payload["ref_audio"] = refp
+                payload["ref_audio_path"] = refp
         if emo and emo != "neutral" and "emotion" not in payload:
             payload["emotion"] = emo
         ih = (f"tts:{u.uid}:{latest.version}:{payload['engine']}:"
@@ -662,7 +766,28 @@ def seed_translation(pid: str, body: dict, db: Session = Depends(get_db)):
     existing = {t.utterance_id: t for t in
                 db.query(Tr).filter_by(target_lang=lang)
                   .order_by(Tr.version).all()}
-    for u, e in zip(utts, entries):
+    # Prefer timestamp alignment. Positional zip is unsafe when the source SRT
+    # contains section markers or when one side has merged/split subtitle lines.
+    # Keep a conservative tolerance for millisecond rounding differences.
+    by_time = {}
+    for e in entries:
+        key = (int(e.get("start_ms", -1)), int(e.get("end_ms", -1)))
+        by_time.setdefault(key, []).append(e)
+    used = set()
+    time_matches = 0
+    for u in utts:
+        candidates = by_time.get((int(u.start_ms or -1), int(u.end_ms or -1)), [])
+        if not candidates:
+            candidates = [e for e in entries
+                          if abs(int(e.get("start_ms", -1)) - int(u.start_ms or -1)) <= 80
+                          and abs(int(e.get("end_ms", -1)) - int(u.end_ms or -1)) <= 80
+                          and id(e) not in used]
+        e = candidates[0] if candidates else None
+        if e is not None:
+            used.add(id(e))
+            time_matches += 1
+        else:
+            continue
         line = _pick(e["text"])
         if not line or is_placeholder(line):
             skipped_cjk += 1
@@ -673,6 +798,20 @@ def seed_translation(pid: str, body: dict, db: Session = Depends(get_db)):
                   version=ver, text=line, llm_model="uploaded",
                   is_approved=True))
         matched += 1
+    # If timestamps matched nothing (e.g. a plain text export), retain the old
+    # positional fallback, but filter obvious section markers first.
+    if not time_matches:
+        for u, e in zip(utts, entries):
+            line = _pick(e["text"])
+            if not line or is_placeholder(line):
+                skipped_cjk += 1
+                continue
+            prev = existing.get(u.id)
+            ver = (prev.version + 1) if prev else 1
+            db.add(Tr(id=_umod.uuid4().hex, utterance_id=u.id, target_lang=lang,
+                      version=ver, text=line, llm_model="uploaded",
+                      is_approved=True))
+            matched += 1
     db.commit()
     return {"ok": True, "utterances": len(utts), "entries": len(entries),
             "matched": matched, "skipped_not_translated": skipped_cjk,
@@ -850,3 +989,44 @@ def get_clip_audio(pid: str, uid: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "clip audio not ready")
     return FileResponse(cl.audio_r2_key, media_type="audio/wav",
                         filename=f"{uid}.wav")
+
+
+@router.post("/projects/{pid}/mode-b/clone-refs")
+def build_clone_refs(pid: str, body: dict, db: Session = Depends(get_db)):
+    from ..db.models import Speaker
+    """简化克隆链（0906用户方案）：不要pyannote。
+    切片已在节点 workdir/zh_refs/{uid}.wav（413个，按LLM绑定归角色）
+    → 每角色取最清晰3句当参考音清单 → tts-batch时payload.ref_audio直接指切片。
+    节点合成时拉该切片做zero-shot克隆。零新依赖。"""
+    import os as _os
+    p = db.get(Project, pid)
+    if not p:
+        raise HTTPException(404)
+    # 从utterances拿speaker绑定+时长, 与节点zh_refs对齐
+    rows = (db.query(Utterance, Speaker)
+              .join(Speaker, Utterance.speaker_id == Speaker.id)
+              .filter(Utterance.project_id == pid,
+                      Utterance.speaker_id.isnot(None)).all())
+    cand: dict[str, dict] = {}
+    for u, spk in rows:
+        dur = (u.end_ms or 0) - (u.start_ms or 0)
+        if not (1000 <= dur <= 10000):
+            continue
+        cand.setdefault(spk.id, {"label": spk.label,
+                                 "items": []})["items"].append(
+            {"uid": u.uid, "dur": dur})
+    out = {}
+    for sid, info in cand.items():
+        items = sorted(info["items"], key=lambda x: -x["dur"])[:3]
+        out[sid] = {"label": info["label"],
+                    "ref_uids": [x["uid"] for x in items]}
+    # 节点侧路径约定: workdir/zh_refs/{uid}.wav — 生成映射文件供tts-batch查
+    ref_map = {sid: [f"/api/nodes/voices/zhaudio_ref/{uid}.wav" for uid in v["ref_uids"]]
+               for sid, v in out.items()}
+    import json as _json
+    storage = _os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+    reg = _os.path.join(storage, "voices_registry.json")
+    reg_data = _json.load(open(reg)) if _os.path.exists(reg) else {}
+    # 把节点切片清单下发（节点自己已有文件，这里只是登记URL路由）
+    return {"ok": True, "speakers": out, "ref_map": ref_map,
+            "note": "tts-batch传 clone_refs=true 即启用角色克隆"}

@@ -160,14 +160,18 @@ def run_qc_hook(task: PipelineTask, db: Session) -> dict:
 
 def qc_summary(db: Session, project_id: str) -> dict:
     """网页质检Tab：项目全任务QC状态聚合。"""
-    tasks = db.query(PipelineTask).filter_by(project_id=project_id).all()
+    # 0905: 只取有qc结果的行（json_extract走索引不现实，但至少排除
+    # output_paths大字段的全量ORM实例化——改用cython级别的列读取）
+    tasks = (db.query(PipelineTask.task_key, PipelineTask.task_type,
+                      PipelineTask.status, PipelineTask.output_paths)
+               .filter_by(project_id=project_id)
+               .filter(PipelineTask.output_paths.isnot(None)).all())
     out = []
-    for t in tasks:
-        outs = t.output_paths if isinstance(t.output_paths, dict) else {}
-        qc = outs.get("qc")
+    for k, tt, st, op in tasks:
+        outs = op if isinstance(op, dict) else {}
+        qc = outs.get("qc") if isinstance(outs, dict) else None
         if qc:
-            out.append({"task_key": t.task_key, "task_type": t.task_type,
-                        "status": t.status, **qc})
+            out.append({"task_key": k, "task_type": tt, "status": st, **qc})
     return {"total": len(out),
             "passed": sum(1 for x in out if x["pass"]),
             "items": out}

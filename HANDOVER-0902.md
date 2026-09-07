@@ -1,8 +1,27 @@
 # 交接文档 · 0902 波（给接手 Agent）
 
-> 2026-09-02 早。前一棒：upgrade agent（wave1-4 升级 + 多角色音色链路 + 白月光实战联测）。
+> 2026-09-02 晚更新。**交接对象已变更：新 Agent 接手（本机 Hermes 退居答疑）。**
+> 前一棒：upgrade agent（wave1-4 升级 + 多角色音色链路 + 白月光实战联测）。
 > 本文是 HANDOVER.md（0900 基线版）的增量补充，冲突处以本文为准。
 > 核心纪律不变：实测与本档冲突 → 改档记日期。动手前先读本文 §四/§六。
+
+---
+
+## ⚡ 0902 晚 重要状态变更（新 Agent 必读）
+
+1. **系统盘已更换**（ESSD 入门款→用户自选新盘，IOPS 事故根治）：**云端是全新空盘，系统需要全新部署**。
+   - 旧盘上的 SQLite（白月光2803句翻译+TTS产物）随旧盘销毁，**白月光需要重跑翻译+TTS**（翻译25min+¥2，TTS看节点）
+   - workbench CLI (`~/bin/workbench`，AK 在 `~/.workbench/config.json`) 依然可用
+   - 部署流程：见 HANDOVER.md §五 + 本档 §五，git archive 或 clone 皆可
+2. **0902 事故已修复并推送**（commit d5f133d + 4a76074，54 tests 绿）：
+   - 根因：437KB b64 参考音塞 pipeline_tasks.output_paths × 8357 条 ≈ 993MB 拖垮 SQLite → 磁盘I/O打满 → 内核崩溃
+   - 修复：音频彻底出库，voice_id + HTTP 按需拉取 + 节点缓存（`/api/nodes/voices/{fid}.wav`）
+   - 红线：**二进制 blob 永远不进任务表 JSON 列**
+   - 附加修复：voices 端点索引缓存(P2) + fid 校验强化(P1)
+3. **当前分支**：`upgrade/seam-wave1`（54 tests 全绿，与 origin 同步）
+4. **本地代码**：`~/duanju/dubbing-system/`（已 checkout 到 upgrade/seam-wave1）
+5. **deepl 审查**：autoclaw 的 b64 出库修复架构正确，本机 Hermes 复审补了 voices 索引缓存+校验强化（P1/P2），无其他阻塞项
+6. **深度设计对照**：`DESIGN-COMPARISON-DEEP.md`（三份微信方案逐条对照，18 项缺口分级，TTS 合规红线：**绝不引入 xTTS v2 / F5-TTS**）
 
 ---
 
