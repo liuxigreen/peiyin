@@ -29,3 +29,6 @@ frontend/dist/
 # --- 系统 ---
 .DS_Store
 HANDOVER-B8.md
+assets/zh_audio.mp3
+assets/
+*.mp3
