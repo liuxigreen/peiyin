@@ -11,8 +11,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import subprocess
 import shutil
+
+
+def _exe(name: str) -> str:
+    cand = os.path.join(os.path.dirname(sys.executable), name + ".exe")
+    if os.path.exists(cand):
+        return cand
+    return shutil.which(name) or name
 
 import numpy as np
 
@@ -35,7 +43,7 @@ def _cut_slots(zh_audio: str, slots: list[dict]) -> list[dict]:
         if not os.path.exists(dst):
             dur = max(0.3, (s["end_ms"] - s["start_ms"]) / 1000)
             subprocess.run(
-                ["ffmpeg", "-y", "-ss", f"{s['start_ms']/1000:.3f}",
+                [_exe("ffmpeg"), "-y", "-ss", f"{s['start_ms']/1000:.3f}",
                  "-t", f"{dur:.3f}", "-i", zh_audio,
                  "-ac", "1", "-ar", "16000", dst],
                 capture_output=True, timeout=60)

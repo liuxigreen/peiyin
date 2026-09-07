@@ -4,8 +4,17 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 import shutil
+
+
+def _exe(name: str) -> str:
+    """节点venv内的exe优先（entrypoint的PATH未必含venv/Scripts）。"""
+    cand = os.path.join(os.path.dirname(sys.executable), name + ".exe")
+    if os.path.exists(cand):
+        return cand
+    return shutil.which(name) or name
 
 from .router import register
 
@@ -25,7 +34,7 @@ def run_separate(task: dict) -> list[dict]:
     os.makedirs(out_dir, exist_ok=True)
 
     # demucs CLI：-n htdemucs 默认输出 vocals.wav + no_vocals.wav
-    cmd = [shutil.which("demucs") or "demucs", "-n", model,
+    cmd = [_exe("demucs"), "-n", model,
            "--two-stems", "vocals", "-o", out_dir, audio]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if proc.returncode != 0:
