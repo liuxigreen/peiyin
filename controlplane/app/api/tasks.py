@@ -13,7 +13,10 @@ router = APIRouter(prefix="/api", tags=["tasks"])
 def retry_task(task_id: str, db: Session = Depends(get_db)):
     """复活一个失败/卡死任务及其受影响下游（下游已完成的按input_hash失效）。
     返回 {ok, retried:[keys], cached:[keys]}。"""
+    # The UI historically sent task_key; accept both that and the UUID primary key.
     t = db.get(PipelineTask, task_id)
+    if not t:
+        t = db.query(PipelineTask).filter(PipelineTask.task_key == task_id).first()
     if not t:
         raise HTTPException(404, "task not found")
     if t.status == "running":
@@ -58,9 +61,9 @@ def project_progress(pid: str, db: Session = Depends(get_db)):
     # 0905 OOM根因#2：progress被前端10s轮询，全量ORM加载5000+行（含output_paths
     # 大字段）→RSS 100MB→1.6GB→被杀。只取聚合需要的轻列，output_paths/永进内存。
     from collections import namedtuple as _nt
-    _Row = _nt("PTask", "task_key task_type resource status created_at")
-    tasks = [_Row(k, tt, r, st, ca) for (k, tt, r, st, ca) in
-             (db.query(PipelineTask.task_key, PipelineTask.task_type,
+    _Row = _nt("PTask", "id task_key task_type resource status created_at")
+    tasks = [_Row(i, k, tt, r, st, ca) for (i, k, tt, r, st, ca) in
+             (db.query(PipelineTask.id, PipelineTask.task_key, PipelineTask.task_type,
                        PipelineTask.resource, PipelineTask.status,
                        PipelineTask.created_at)
                 .filter_by(project_id=pid).all())]
@@ -85,13 +88,24 @@ def project_progress(pid: str, db: Session = Depends(get_db)):
             "failed": sum(1 for t in rel if t.status in ("failed", "dead")),
         }
     recent = sorted(tasks, key=lambda x: x.created_at or "")[-20:]
+    p = db.get(Project, pid)
+    mode_b = ((p.config or {}).get("mode_b_run") if p else None) or {}
+    mode_b_total = int(mode_b.get("total_scenes") or 0)
+    mode_b_done = int(mode_b.get("completed_scenes") or 0)
+    if mode_b_total and not tasks:
+        phases["translate"] = {"total": mode_b_total, "done": mode_b_done,
+                                "failed": 1 if mode_b.get("state") == "failed" else 0}
+        mode_b_pct = round(mode_b_done / mode_b_total * 100, 1)
+    else:
+        mode_b_pct = None
     return {
-        "percent": round(done_w / total * 100, 1),
+        "percent": mode_b_pct if mode_b_pct is not None else round(done_w / total * 100, 1),
+        "mode_b": mode_b,
         "phases": phases,
         "counts": {s: sum(1 for t in tasks if t.status == s)
                    for s in ("pending", "queued", "running",
                              "completed", "failed", "dead")},
-        "recent_tasks": [{"key": t.task_key, "type": t.task_type,
+        "recent_tasks": [{"id": t.id, "key": t.task_key, "type": t.task_type,
                           "status": t.status} for t in recent],
     }
 

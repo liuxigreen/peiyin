@@ -204,8 +204,9 @@ def get_voice_registry():
 def get_zh_audio(name: str):
     """节点拉取整条原配音音频（diarize/克隆用）。名字白名单。"""
     import json as _json
+    import re as _re2
     from fastapi.responses import FileResponse
-    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
+    if not _re2.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
         raise HTTPException(400)
     reg_path = os.path.join(os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b"),
                             "voices_registry.json")

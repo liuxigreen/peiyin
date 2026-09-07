@@ -27,21 +27,26 @@ def audio_slots(audio_path: str, entries: list[dict], out_dir: str) -> list[dict
     """B2：按SRT时间窗从整条中文配音音频切分每句参考音频。
     返回 [{uid, seq_index, start_ms, end_ms, ref_path, ref_duration_ms}]。"""
     os.makedirs(out_dir, exist_ok=True)
-    data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
-    mono = data.mean(axis=1)
-    total_ms = len(mono) / sr * 1000
     slots = []
-    for i, e in enumerate(entries, 1):
-        s = max(0, int(e["start_ms"] / 1000 * sr))
-        en = min(len(mono), int(e["end_ms"] / 1000 * sr))
-        seg = mono[s:en]
-        ref = os.path.join(out_dir, f"zh_{i:04d}.wav")
-        sf.write(ref, seg, sr)
-        slots.append({"uid": e.get("uid", f"U{i:04d}"), "seq_index": i,
-                      "start_ms": e["start_ms"], "end_ms": e["end_ms"],
-                      "ref_path": ref,
-                      "ref_duration_ms": int(len(seg) / sr * 1000),
-                      "within_audio": e["end_ms"] <= total_ms + 500})
+    # 不用 sf.read：长音频只保留当前台词窗口，峰值随最大窗口而非总时长增长。
+    with sf.SoundFile(audio_path) as source:
+        sr = source.samplerate
+        total_frames = source.frames
+        total_ms = total_frames / sr * 1000
+        for i, e in enumerate(entries, 1):
+            s = min(total_frames, max(0, int(e["start_ms"] / 1000 * sr)))
+            en = min(total_frames, max(0, int(e["end_ms"] / 1000 * sr)))
+            if en < s:
+                en = s
+            source.seek(s)
+            seg = source.read(en - s, dtype="float32", always_2d=True).mean(axis=1)
+            ref = os.path.join(out_dir, f"zh_{i:04d}.wav")
+            sf.write(ref, seg, sr)
+            slots.append({"uid": e.get("uid", f"U{i:04d}"), "seq_index": i,
+                          "start_ms": e["start_ms"], "end_ms": e["end_ms"],
+                          "ref_path": ref,
+                          "ref_duration_ms": int(len(seg) / sr * 1000),
+                          "within_audio": e["end_ms"] <= total_ms + 500})
     return slots
 
 

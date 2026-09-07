@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+os.environ.setdefault("HF_HUB_OFFLINE","1")
+os.environ.setdefault("HF_ENDPOINT","https://hf-mirror.com")
 import subprocess
 import shutil
 
@@ -65,8 +67,8 @@ def run_diarize(task: dict) -> list[dict]:
         base = os.getenv("CONTROL_URL", "").rstrip("/")
         token = ""
         try:
-            tf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                              "node_token.txt")
+            tf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "workdir", "node_token.txt")
             token = open(tf).read().strip()
         except Exception:
             pass
@@ -98,7 +100,21 @@ def run_diarize(task: dict) -> list[dict]:
 
     # pyannote 声纹提取（首次运行需 HUGGINGFACE_TOKEN 下载模型）
     from pyannote.audio import Model, Inference
-    model = Model.from_pretrained("pyannote/embedding", use_auth_token=HUGGINGFACE_TOKEN or None)
+    # Windows symlink不可靠 → 不走HF缓存解析，直接本地bin路径加载
+    _local_bin = os.path.join(WORKDIR, "pyannote_embedding.bin")
+    if os.path.exists(_local_bin):
+        model = Model.from_pretrained(_local_bin)
+    else:
+        model = Model.from_pretrained("pyannote/embedding",
+                                      use_auth_token=HUGGINGFACE_TOKEN or None)
+        import shutil as _sh
+        _snap = os.path.join(os.getenv("HF_HOME", ""), "hub",
+                             "models--pyannote--embedding", "snapshots")
+        if os.path.isdir(_snap):
+            for root, _, files in os.walk(_snap):
+                if "pytorch_model.bin" in files:
+                    _sh.copy(os.path.join(root, "pytorch_model.bin"), _local_bin)
+                    break
     infer = Inference(model, window="whole")
     embs, ok_wavs = [], []
     for i, w in enumerate(wavs):
