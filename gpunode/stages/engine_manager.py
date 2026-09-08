@@ -16,6 +16,13 @@ ENGINE_PORT = 50000
 IDLE_MIN = 15
 ENGINE_MARK = "cosyvoice_server.py"
 
+# 强制绕过系统代理（计划任务环境无 NO_PROXY，urllib 会走 127.0.0.1:7897）
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
+import urllib.request as _ur
+_opener = _ur.build_opener(_ur.ProxyHandler({}))
+
+
 def log(m):
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(f"{datetime.now().strftime('%m-%d %H:%M:%S')} {m}\n")
@@ -27,7 +34,7 @@ def api(path, method="GET", body=None, timeout=30):
     req = urllib.request.Request(BASE + path, method=method,
         headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"},
         data=json.dumps(body).encode() if body else None)
-    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    return json.loads(_opener.open(req, timeout=timeout).read())
 
 def engine_alive() -> bool:
     r = subprocess.run(["powershell", "-NoProfile", "-Command",
