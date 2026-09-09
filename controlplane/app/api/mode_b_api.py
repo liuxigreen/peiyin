@@ -7,7 +7,7 @@ import os
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from ..db.models import Project, Translation, Utterance
+from ..db.models import Project, Translation, Utterance, PipelineTask
 from ..db.session import get_db
 from ..mode_b import audio_slots, build_package, tts_clips_mock
 from ..translate_executor import run_translate_scene
@@ -76,10 +76,35 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
     out_dir = os.path.join(work, "package")
     os.makedirs(out_dir, exist_ok=True)
 
-    # B2 槽位（无音频时跳过——纯翻译模式）
     entries = [{"uid": u.uid, "start_ms": u.start_ms, "end_ms": u.end_ms}
                for u in utts]
-    slots = audio_slots(audio_path, entries, os.path.join(work, "zh_refs")) if has_audio else []
+    # B2：混音输入先进入 GPU 人声分离；禁止控制面直接切混音或生成 mock 音频。
+    if has_audio:
+        import datetime as _dt, uuid as _uuid
+        vid = "zh" + _dt.datetime.now().strftime("%m%d%H%M")
+        reg = os.path.join(STORAGE, "voices_registry.json")
+        reg_data = _json.load(open(reg, encoding="utf-8")) if os.path.exists(reg) else {}
+        reg_data[vid + ".mp3"] = audio_path
+        with open(reg, "w", encoding="utf-8") as f:
+            _json.dump(reg_data, f)
+        ih = f"separate-vocals:{pid}:{os.path.getsize(audio_path)}:{os.path.getmtime(audio_path)}"
+        sep = (db.query(PipelineTask).filter_by(project_id=pid, task_type="separate-vocals",
+                                                input_hash=ih).first())
+        if not sep or sep.status == "dead":
+            sep = PipelineTask(project_id=pid, task_key=f"SEPARATE/{pid[:8]}/{_uuid.uuid4().hex[:8]}",
+                               task_type="separate-vocals", resource="gpu", gpu_required=True,
+                               weight=5, status="pending", input_hash=ih,
+                               output_paths={"payload": {"audio_url": f"/api/nodes/voices/zhaudio/{vid}.mp3",
+                                                         "model": "htdemucs"}})
+            db.add(sep); db.commit()
+        cfg = dict(p.config or {})
+        cfg["mode_b_run"] = {"state": "waiting_separation", "phase": "separate",
+                              "separation_task_id": sep.id}
+        p.config = cfg; db.commit()
+        return {"ok": True, "mode": "B", "phase": "separate", "task_id": sep.id,
+                "note": "已创建 Demucs 人声分离任务，完成后进入真实克隆链路"}
+    # 无音频时只允许翻译，不生成任何伪造配音。
+    slots = []
     # B3 翻译（五步链，live provider；含语种校验兜底）
     scenes = sorted({(u.uid or "SC01").split("-")[0] for u in utts})
     # 上传翻译直连：已有非占位译文的场景跳过LLM（不烧网关配额）
@@ -107,17 +132,10 @@ async def run_mode_b(pid: str, db: Session = Depends(get_db)):
         latest[t.utterance_id] = t
     translations = {u.uid: (latest[u.id].text if u.id in latest else "")
                     for u in utts}
-    # B4/B6：有音频才生成TTS与交付包；无音频=纯翻译模式（音频后补再run一次出包）
+    # 生产链禁止占位正弦波；真实音频必须来自 tts-batch 节点产物。
     if has_audio:
-        fitted = tts_clips_mock(slots, p.target_lang, os.path.join(work, "dub"))
-        qc = {"syllable_over": sum(1 for r in tr_results for k in [r] if r.get("over_limit")),
-              "translations": len(translations),
-              "slots_out_of_audio": sum(1 for s in slots if not s["within_audio"])}
-        pkg = build_package({"id": pid, "name": p.name, "target_lang": p.target_lang},
-                            entries, translations, fitted, out_dir, qc)
-        return {"ok": True, "package": pkg, "clips": len(fitted),
-                "scenes_translated": len(tr_results), "mode": "B",
-                "translations": translations}
+        raise HTTPException(409,
+                            "翻译已完成，但真实 tts-batch 尚未接通；禁止生成占位音频")
     return {"ok": True, "mode": "B", "translations": translations,
             "clips": 0, "note": "纯翻译完成；补传配音后再次run即可生成交付包",
             "scenes_translated": len(tr_results)}
@@ -425,18 +443,19 @@ def create_diarize_task(pid: str, body: dict, db: Session = Depends(get_db)):
         reg_data = _json.load(open(reg))
     reg_data[vid + ".mp3"] = audio_path
     _json.dump(reg_data, open(reg, "w"))
+    zh_audio_url = f"/api/nodes/voices/zhaudio/{vid}.mp3"
     ts = int(_dt.datetime.now().timestamp())
     t = PipelineTask(
         project_id=pid, task_key=f"DIARIZE/{ts}", task_type="diarize",
         resource="gpu", gpu_required=True, weight=5, depends_on=[],
         input_hash=f"diarize:{pid}:{ts}", status="pending",
         output_paths={"payload": {
-            "project_id": pid, "zh_audio_url": f"/api/nodes/voices/{vid}.mp3",
+            "project_id": pid, "zh_audio_url": zh_audio_url,
             "srt_slots": slots}})
     db.add(t)
     db.commit()
     return {"ok": True, "task_id": t.id, "slots": len(slots),
-            "audio_url": f"/api/nodes/voices/{vid}.mp3",
+            "audio_url": zh_audio_url,
             "note": "节点跑完回传 diarize_result.json"}
 
 

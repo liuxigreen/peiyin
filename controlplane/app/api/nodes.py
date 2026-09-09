@@ -146,22 +146,86 @@ def complete(task_id: str, body: dict, authorization: str = Header(default=""),
     # ①节点dispatch发的是列表，整行赋值后qc钩子判定非dict→output_paths只剩{"qc"}；
     # ②即便dict也被整行覆盖，artifact回传时payload里的uid/engine已丢失。
     body_out = body.get("outputs", {})
-    payload = (t.output_paths or {}).get("payload")
-    outs = {"outputs": body_out} if isinstance(body_out, list) else dict(body_out)
-    if payload is not None and "payload" not in outs:
-        outs["payload"] = payload
+    # 上传可能早于 complete：在已有控制面产物之上合并节点回报，不能把
+    # payload/artifacts 整行覆盖掉。列表保持既有的 outputs 兼容结构；字典
+    # 仍按历史语义展开到 output_paths 顶层。
+    outs = dict(t.output_paths or {})
+    if isinstance(body_out, list):
+        outs["outputs"] = body_out
+    elif isinstance(body_out, dict):
+        for name, value in body_out.items():
+            if name not in ("payload", "artifacts"):
+                outs[name] = value
     t.output_paths = outs
     t.output_hash = body.get("output_hash")
     t.lease_until = None
     db.commit()
     from ..qc_agent import run_qc_hook
     qc = run_qc_hook(t, db)          # 节点完成路径同样过QC Agent
+    _queue_diarize_handoff(db, t)
+    db.commit()
     return {"ok": True, "qc_pass": qc["pass"], "qc_action": qc["action"]}
 
 
 _ART_MAX_MB = int(os.getenv("NODE_ARTIFACT_MAX_MB", "80"))
 _VOICES_DIR = os.getenv("NODE_VOICES_DIR",
                         os.path.join(os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b"), "voices"))
+_ART_TOKEN_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}")
+_TASK_ID_RE = _re.compile(r"[A-Za-z0-9_-]{1,80}")
+
+
+def _safe_artifact_token(value: str) -> bool:
+    """仅允许控制面可稳定定位的单段 artifact key/文件名。"""
+    return bool(_ART_TOKEN_RE.fullmatch(value)) and ".." not in value
+
+
+def _artifact_url(task_id: str, key: str, filename: str) -> str:
+    return f"/api/nodes/tasks/{task_id}/artifacts/{key}/{filename}"
+
+
+def _queue_diarize_handoff(db: Session, source: "m.PipelineTask") -> None:
+    """仅在 control-plane vocals artifact 已持久化后排入 diarize。
+
+    节点上报的 outputs 路径只可作为诊断信息，绝不能成为另一节点的输入。
+    """
+    if source.task_type != "separate-vocals" or source.status != "completed":
+        return
+    outs = dict(source.output_paths or {})
+    artifact = next((a for a in (outs.get("artifacts") or [])
+                     if isinstance(a, dict) and a.get("key") == "vocals"), None)
+    if not artifact:
+        return
+    filename = artifact.get("filename")
+    if not isinstance(filename, str) or not _safe_artifact_token(filename):
+        return
+    handoff_url = _artifact_url(source.id, "vocals", filename)
+    from ..db.models import Utterance
+    slots = [{"uid": u.uid, "start_ms": u.start_ms, "end_ms": u.end_ms}
+             for u in db.query(Utterance).filter_by(project_id=source.project_id)
+             .order_by(Utterance.seq_index).all()
+             if (u.end_ms or 0) > (u.start_ms or 0)]
+    input_hash = hashlib.sha256(
+        f"diarize:{source.project_id}:{source.input_hash}:vocals".encode()
+    ).hexdigest()
+    diarize = (db.query(m.PipelineTask)
+               .filter(m.PipelineTask.project_id == source.project_id,
+                       m.PipelineTask.task_type == "diarize",
+                       m.PipelineTask.input_hash == input_hash,
+                       m.PipelineTask.status != "dead").first())
+    if diarize is None:
+        db.add(m.PipelineTask(
+            project_id=source.project_id,
+            task_key=f"DIARIZE/{source.id[:8]}",
+            task_type="diarize", resource="gpu", gpu_required=True,
+            weight=5, depends_on=[source.task_key], input_hash=input_hash, status="pending",
+            output_paths={"payload": {"zh_audio_url": handoff_url, "srt_slots": slots}}))
+        return
+    diarize_outs = dict(diarize.output_paths or {})
+    payload = dict(diarize_outs.get("payload") or {})
+    payload.update({"zh_audio_url": handoff_url, "srt_slots": slots})
+    payload.pop("zh_audio", None)
+    diarize_outs["payload"] = payload
+    diarize.output_paths = diarize_outs
 
 
 # P2修复：进程级音色索引缓存（md5→path），避免每请求遍历+读文件算md5
@@ -205,7 +269,7 @@ def get_zh_audio(name: str):
     """节点拉取整条原配音音频（diarize/克隆用）。名字白名单。"""
     import json as _json
     from fastapi.responses import FileResponse
-    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
+    if not _re.fullmatch(r"[A-Za-z0-9_.\-]{1,120}", name):
         raise HTTPException(400)
     reg_path = os.path.join(os.environ.get("MODE_B_STORAGE", "/tmp/peiyin-mode-b"),
                             "voices_registry.json")
@@ -231,6 +295,16 @@ def get_voice(fid: str):
     raise HTTPException(404)
 
 
+@router.get("/engine-should-run")
+def engine_should_run(db: Session = Depends(get_db)):
+    """节点引擎管家信号：有无 pending/running 的 TTS 任务。
+    有 → 节点拉起 CosyVoice；空闲超时 → 节点自行关停引擎。"""
+    n = db.query(m.PipelineTask).filter(
+        m.PipelineTask.task_type == "tts-generate",
+        m.PipelineTask.status.in_(("pending", "running"))).count()
+    return {"should_run": n > 0, "pending_tts": n}
+
+
 @router.post("/tasks/{task_id}/artifact")
 async def upload_artifact(task_id: str, request: "Request", filename: str = "",
                           key: str = "", authorization: str = Header(default=""),
@@ -245,10 +319,14 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
         raise HTTPException(404)
     if t.claimed_by and t.claimed_by != node.id:
         raise HTTPException(409, "task not claimed by this node")
+    fname = filename or f"{t.task_key}.bin"
+    artifact_key = key or fname
+    if (not _TASK_ID_RE.fullmatch(task_id) or not _safe_artifact_token(fname)
+            or not _safe_artifact_token(artifact_key)):
+        raise HTTPException(400, "invalid artifact key or filename")
     storage = os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
     dest_dir = os.path.join(storage, "artifacts", task_id)
     os.makedirs(dest_dir, exist_ok=True)
-    fname = os.path.basename(filename or f"{t.task_key}.bin") or "artifact.bin"
     dest = os.path.join(dest_dir, fname)
     size = 0
     with open(dest, "wb") as f:
@@ -259,15 +337,52 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
                 os.remove(dest)
                 raise HTTPException(413, f"artifact exceeds {_ART_MAX_MB}MB")
             f.write(chunk)
-    entry = {"key": key or fname, "path": dest, "bytes": size}
+    entry = {"key": artifact_key, "filename": fname, "path": dest, "bytes": size}
     outs = dict(t.output_paths or {})
     arts = [a for a in (outs.get("artifacts") or []) if a.get("key") != entry["key"]]
     arts.append(entry)
     outs["artifacts"] = arts          # JSON列整体重赋值（原地改不落库，HANDOVER坑#4）
     t.output_paths = outs
     clip_info = _upsert_tts_clip(db, t, dest)
+    _queue_diarize_handoff(db, t)
     db.commit()
     return {"ok": True, "artifact": entry, "tts_clip": clip_info}
+
+
+@router.get("/tasks/{task_id}/artifacts/{key}/{filename}")
+def download_artifact(task_id: str, key: str, filename: str,
+                      authorization: str = Header(default=""),
+                      db: Session = Depends(get_db)):
+    """向已领取对应 diarize 任务的节点下发控制面保存的产物。"""
+    if (not _TASK_ID_RE.fullmatch(task_id) or not _safe_artifact_token(key)
+            or not _safe_artifact_token(filename)):
+        raise HTTPException(400, "invalid artifact locator")
+    node = _auth_node(db, authorization)
+    source = db.get(m.PipelineTask, task_id)
+    if source is None:
+        raise HTTPException(404)
+    requested_url = _artifact_url(task_id, key, filename)
+    # 上传者不等于消费者；只有已领取且 payload 明确引用此 handoff 的 diarize
+    # 节点能下载。未知 token 和其他节点都不能借 URL 读取项目产物。
+    consumer = (db.query(m.PipelineTask)
+                .filter(m.PipelineTask.project_id == source.project_id,
+                        m.PipelineTask.task_type == "diarize",
+                        m.PipelineTask.claimed_by == node.id,
+                        m.PipelineTask.status == "running").all())
+    if not any(((row.output_paths or {}).get("payload") or {}).get("zh_audio_url")
+               == requested_url for row in consumer):
+        raise HTTPException(403, "artifact not assigned to this node")
+    artifact = next((a for a in ((source.output_paths or {}).get("artifacts") or [])
+                     if isinstance(a, dict) and a.get("key") == key
+                     and a.get("filename") == filename), None)
+    if artifact is None:
+        raise HTTPException(404)
+    storage = os.path.realpath(os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b"))
+    path = os.path.realpath(os.path.join(storage, "artifacts", task_id, filename))
+    if os.path.commonpath((storage, path)) != storage or not os.path.isfile(path):
+        raise HTTPException(404)
+    from fastapi.responses import FileResponse
+    return FileResponse(path, filename=filename)
 
 
 def _upsert_tts_clip(db: Session, t: "m.PipelineTask", path: str) -> dict | None:

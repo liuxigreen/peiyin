@@ -12,6 +12,8 @@ import os
 import sys
 import subprocess
 import shutil
+import urllib.request
+from urllib.parse import urljoin
 
 from .router import register
 
@@ -44,8 +46,21 @@ def _find_ffmpeg() -> str | None:
 def run_separate(task: dict) -> list[dict]:
     payload = task.get("payload") or {}
     audio = payload.get("audio_path") or ""
+    if not audio:
+        audio_url = payload.get("audio_url") or ""
+        if audio_url:
+            base = os.getenv("CONTROL_URL", "")
+            url = urljoin(base.rstrip("/") + "/", audio_url)
+            audio = os.path.join(WORKDIR, "inputs", os.path.basename(audio_url))
+            os.makedirs(os.path.dirname(audio), exist_ok=True)
+            req = urllib.request.Request(url)
+            token = os.getenv("NODE_TOKEN", "")
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=300) as src, open(audio, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
     if not audio or not os.path.exists(audio):
-        raise RuntimeError(f"audio_path not found on node: {audio}")
+        raise RuntimeError(f"audio input not found on node: {audio}")
     model = payload.get("model", "htdemucs")
     out_dir = payload.get("out_dir") or os.path.join(OUTDIR, os.path.basename(audio).rsplit(".", 1)[0])
     os.makedirs(out_dir, exist_ok=True)

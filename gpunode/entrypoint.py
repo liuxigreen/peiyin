@@ -73,20 +73,22 @@ ART_MAX_MB = int(os.getenv("NODE_ARTIFACT_MAX_MB", "80"))
 
 
 def upload_artifacts(tid: str, outputs):
-    """G6产物回传：outputs里节点本地文件POST回控制面（raw body，免multipart）。
-    失败仅告警——complete已成功，控制面仍可按 output_paths 里节点侧path补拉。"""
+    """Upload every existing local output before the task is completed.
+
+    A failed upload is deliberately raised to dispatch. That keeps the
+    task retryable and leaves its local output available to the retry.
+    """
     import os as _os
     for o in (outputs if isinstance(outputs, list) else []):
         p = (o or {}).get("path")
         if not p or not _os.path.isfile(p):
             continue
+        sz = _os.path.getsize(p)
+        if sz > ART_MAX_MB << 20:
+            raise RuntimeError(f"artifact exceeds {ART_MAX_MB}MB limit: {p}")
+        with open(p, "rb") as f:
+            data = f.read()
         try:
-            sz = _os.path.getsize(p)
-            if sz > ART_MAX_MB << 20:
-                print(f"[art] skip >{ART_MAX_MB}MB: {p}")
-                continue
-            with open(p, "rb") as f:
-                data = f.read()
             r = HTTP.post(
                 f"{CONTROL}/api/nodes/tasks/{tid}/artifact",
                 params={"filename": _os.path.basename(p), "key": o.get("key", "")},
@@ -94,9 +96,9 @@ def upload_artifacts(tid: str, outputs):
                          "Content-Type": "application/octet-stream"},
                 content=data, timeout=300)
             r.raise_for_status()
-            print(f"[art] uploaded {_os.path.basename(p)} ({sz >> 10}KB)")
         except Exception as e:
-            print("[art] upload fail:", e)
+            raise RuntimeError(f"artifact upload failed for {p}: {e}") from e
+        print(f"[art] uploaded {_os.path.basename(p)} ({sz >> 10}KB)")
 
 
 def dispatch(task: dict):
@@ -111,11 +113,11 @@ def dispatch(task: dict):
     try:
         from stages.router import run_task     # G0后实装：按type分发到stages/*
         outputs = run_task(task)
+        upload_artifacts(tid, outputs)
         HTTP.post(f"{CONTROL}/api/nodes/tasks/{tid}/complete",
                    headers={"Authorization": f"Bearer {state['token']}"},
                    json={"outputs": outputs})
         print(f"[ok] {ttype} {tid[:8]}")
-        upload_artifacts(tid, outputs)         # G6：产物文件回传控制面
     except Exception as e:
         retryable = "OOM" not in str(e).upper()
         HTTP.post(f"{CONTROL}/api/nodes/tasks/{tid}/fail",
