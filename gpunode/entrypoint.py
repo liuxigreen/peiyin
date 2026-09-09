@@ -2,6 +2,11 @@
 模型层(stages/*)真实加载放G0(GPU机器就位后)。此骨架完成协议闭环可自测。"""
 import os, sys, threading, time, httpx, json
 
+try:
+    from . import node_jobs
+except ImportError:
+    import node_jobs
+
 CONTROL = os.getenv("CONTROL_URL", "http://localhost:8500")
 # 持久连接：claim/complete/heartbeat/artifact 全部复用同一条 keep-alive 连接。
 # 节点走代理+CF隧道，每请求新建连接的握手开销实测把吞吐拖到5句/分；
@@ -120,6 +125,11 @@ def dispatch(task: dict):
     finally:
         stop_flag[0] = True   # 停任务心跳线程
 
+
+def run_node_job():
+    """Synchronously claim and finish at most one Stage 1 node job."""
+    return node_jobs.run_node_job(HTTP, CONTROL, state["token"])
+
 def main():
     register()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
@@ -153,6 +163,7 @@ def main():
                 print(f"[dispatch] {task.get('task_key')} in pool")
                 threading.Thread(target=_worker, args=(task,), daemon=True).start()
             else:
+                run_node_job()
                 sem.release()
                 time.sleep(POLL_IDLE)
         except KeyboardInterrupt:

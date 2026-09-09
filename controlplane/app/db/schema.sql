@@ -109,6 +109,32 @@ CREATE INDEX IF NOT EXISTS idx_tasks_cache ON pipeline_tasks(input_hash)
 CREATE INDEX IF NOT EXISTS idx_tasks_ready ON pipeline_tasks(status, gpu_required)
     WHERE status = 'pending';
 
+-- Stage 1：独立节点短作业队列（不改变 pipeline_tasks）
+CREATE TABLE IF NOT EXISTS node_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    target_node_name VARCHAR(100) NOT NULL,
+    kind VARCHAR(50) NOT NULL,
+    spec_version VARCHAR(32) NOT NULL DEFAULT '1',
+    params JSONB NOT NULL DEFAULT '{}',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    checkpoint JSONB,
+    result JSONB,
+    claimed_by UUID,
+    lease_until TIMESTAMPTZ,
+    heartbeat_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    error VARCHAR(500),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (char_length(error) <= 500)
+);
+CREATE INDEX IF NOT EXISTS idx_node_jobs_claim
+    ON node_jobs(status, target_node_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_node_jobs_lease
+    ON node_jobs(status, lease_until);
+
 CREATE TABLE IF NOT EXISTS translation_providers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(64) NOT NULL,

@@ -4,7 +4,8 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from .db.session import init_db
-from .api import nodes, upload, projects, providers, assets, tasks, translate, agents, mode_b_api
+from .api import (nodes, upload, projects, providers, assets, tasks, translate,
+                  agents, mode_b_api, node_jobs)
 
 app = FastAPI(title="Dubbing Platform Control Plane", version="0.3.0")
 
@@ -42,6 +43,8 @@ app.include_router(projects.router)
 app.include_router(providers.router)
 app.include_router(assets.router)
 app.include_router(nodes.router)
+app.include_router(node_jobs.node_router)
+app.include_router(node_jobs.router)
 app.include_router(upload.router)
 app.include_router(tasks.router)
 app.include_router(translate.router)

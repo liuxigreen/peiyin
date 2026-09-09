@@ -130,6 +130,40 @@ class PipelineTask(Base):
         Index("uq_tasks_key", "project_id", "task_key", unique=True),
     )
 
+
+class NodeJob(Base):
+    """独立于 PipelineTask 的节点短作业队列。
+
+    Stage 1 只承载控制面到单个稳定节点名的轻量作业。领取时用
+    ``target_node_name`` 做路由，``claimed_by`` 保存当前 token 对应的
+    GpuNode id，因而同名重注册不会让旧作业主权发生漂移。
+    """
+    __tablename__ = "node_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    target_node_name: Mapped[str] = mapped_column(String(100))
+    kind: Mapped[str] = mapped_column(String(50))
+    spec_version: Mapped[str] = mapped_column(String(32), default="1")
+    params: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    checkpoint: Mapped[object | None] = mapped_column(JSON, nullable=True)
+    result: Mapped[object | None] = mapped_column(JSON, nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_retries: Mapped[int] = mapped_column(Integer, default=3)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    __table_args__ = (
+        Index("idx_node_jobs_claim", "status", "target_node_name", "created_at"),
+        Index("idx_node_jobs_lease", "status", "lease_until"),
+    )
+
+
 class GpuNode(Base):
     __tablename__ = "gpu_nodes"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
