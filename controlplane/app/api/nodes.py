@@ -52,8 +52,18 @@ def _auth_node(db: Session, authorization: str) -> m.GpuNode:
     return node
 
 @router.post("/heartbeat")
-def heartbeat(authorization: str = Header(default=""), db: Session = Depends(get_db)):
+def heartbeat(body: dict | None = None, authorization: str = Header(default=""),
+              db: Session = Depends(get_db)):
     node = _auth_node(db, authorization)
+    # 节点能力可能随受控模型发布改变；只接受一个短字符串列表，避免让心跳
+    # 成为任意 JSON 的写入通道。未提供时保持向后兼容。
+    if body and "capabilities" in body:
+        caps = body["capabilities"]
+        if (not isinstance(caps, list) or len(caps) > 32
+                or any(not isinstance(cap, str) or not _re.fullmatch(r"[a-z0-9_-]{1,48}", cap)
+                       for cap in caps)):
+            raise HTTPException(400, "invalid capabilities")
+        node.capabilities = list(dict.fromkeys(caps))
     node.last_heartbeat = datetime.now(timezone.utc)
     node.online = True
     db.commit()

@@ -195,6 +195,15 @@ def _patch_main_common(monkeypatch, http, workers=1):
     monkeypatch.setenv("NODE_WORKERS", str(workers))
 
 
+def test_advertised_capabilities_require_ready_ecapa(monkeypatch):
+    monkeypatch.setenv("CAPABILITIES", "tts,asr,sep,diarize,tts")
+    monkeypatch.setattr(entrypoint, "ecapa_preflight", lambda: types.SimpleNamespace(ready=False))
+    assert entrypoint.advertised_capabilities() == ["tts", "asr", "sep"]
+
+    monkeypatch.setattr(entrypoint, "ecapa_preflight", lambda: types.SimpleNamespace(ready=True))
+    assert entrypoint.advertised_capabilities() == ["tts", "asr", "sep", "diarize"]
+
+
 def test_pipeline_claim_has_priority_before_one_idle_node_job(monkeypatch):
     http = _LoopHTTP(
         get_responses=[

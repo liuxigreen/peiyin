@@ -51,6 +51,27 @@ def _submit(client: TestClient, target: str = "node-a", **extra):
     return response.json()
 
 
+def test_heartbeat_updates_validated_node_capabilities(app_client):
+    client, SessionLocal = app_client
+    token = _register(client, "capability-node")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    updated = client.post("/api/nodes/heartbeat", headers=headers,
+                          json={"capabilities": ["tts", "asr", "sep", "diarize", "tts"]})
+    assert updated.status_code == 200, updated.text
+    invalid = client.post("/api/nodes/heartbeat", headers=headers,
+                          json={"capabilities": ["diarize", "not valid"]})
+    assert invalid.status_code == 400
+
+    db = SessionLocal()
+    try:
+        from app.db.models import GpuNode
+        node = db.query(GpuNode).filter_by(token_hash=__import__("hashlib").sha256(token.encode()).hexdigest()).one()
+        assert node.capabilities == ["tts", "asr", "sep", "diarize"]
+    finally:
+        db.close()
+
+
 def test_management_auth_and_submit(app_client):
     client, _SessionLocal = app_client
     body = {"target_node_name": "node-a", "kind": "probe", "params": {"x": 1}}

@@ -7,6 +7,11 @@ try:
 except ImportError:
     import node_jobs
 
+try:
+    from .model_inventory import ecapa_preflight
+except ImportError:
+    from model_inventory import ecapa_preflight
+
 CONTROL = os.getenv("CONTROL_URL", "http://localhost:8500")
 # 持久连接：claim/complete/heartbeat/artifact 全部复用同一条 keep-alive 连接。
 # 节点走代理+CF隧道，每请求新建连接的握手开销实测把吞吐拖到5句/分；
@@ -19,6 +24,25 @@ state = {"token": os.getenv("NODE_TOKEN", "dev-node-token")}
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "workdir", "node_token.txt")
 
+
+def advertised_capabilities() -> list[str]:
+    """Report only configured capabilities whose local prerequisites are ready.
+
+    A node may opt into diarization with CAPABILITIES, but it must not be
+    eligible for diarize work until the checked local ECAPA snapshot is ready.
+    """
+    raw = os.getenv("CAPABILITIES", "tts,asr,sep")
+    capabilities = list(dict.fromkeys(
+        value.strip() for value in raw.split(",") if value.strip()
+    ))
+    if "diarize" in capabilities:
+        try:
+            if not ecapa_preflight().ready:
+                capabilities.remove("diarize")
+        except Exception:
+            capabilities.remove("diarize")
+    return capabilities
+
 def register():
     """token持久化：重启复用已存token（心跳验证），失效才重新register——
     原实现每次重启换新token，控制面节点行无限堆积。"""
@@ -28,6 +52,7 @@ def register():
             try:
                 HTTP.post(f"{CONTROL}/api/nodes/heartbeat",
                            headers={"Authorization": f"Bearer {tok}"},
+                           json={"capabilities": advertised_capabilities()},
                            timeout=10).raise_for_status()
                 state["token"] = tok
                 print("[node] token reused")
@@ -37,7 +62,8 @@ def register():
     r = HTTP.post(f"{CONTROL}/api/nodes/register",
                    headers={"x-node-secret": NODE_SHARED_SECRET},
                    json={"name": os.uname().nodename, "gpu_model": os.getenv("GPU_MODEL", "?"),
-                         "vram_gb": int(os.getenv("GPU_VRAM", "0")), "capabilities": ["tts","asr","sep"]})
+                         "vram_gb": int(os.getenv("GPU_VRAM", "0")),
+                         "capabilities": advertised_capabilities()})
     r.raise_for_status()
     state["token"] = r.json()["node_token"]
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
@@ -49,7 +75,8 @@ def heartbeat_loop():
     while True:
         try:
             HTTP.post(f"{CONTROL}/api/nodes/heartbeat",
-                       headers={"Authorization": f"Bearer {state['token']}"}, timeout=10)
+                       headers={"Authorization": f"Bearer {state['token']}"},
+                       json={"capabilities": advertised_capabilities()}, timeout=10)
         except Exception as e:
             print("[hb] offline:", e)
         time.sleep(60)
