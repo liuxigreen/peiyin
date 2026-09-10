@@ -33,11 +33,11 @@ def app_client(tmp_path, monkeypatch):
         yield client, dbsession.SessionLocal
 
 
-def _register(client: TestClient, name: str) -> str:
+def _register(client: TestClient, name: str, capabilities=None) -> str:
     response = client.post(
         "/api/nodes/register",
         headers=NODE_SECRET,
-        json={"name": name, "gpu_model": "test", "capabilities": ["probe"]},
+        json={"name": name, "gpu_model": "test", "capabilities": capabilities or ["probe"]},
     )
     assert response.status_code == 200, response.text
     return response.json()["node_token"]
@@ -70,6 +70,29 @@ def test_heartbeat_updates_validated_node_capabilities(app_client):
         assert node.capabilities == ["tts", "asr", "sep", "diarize"]
     finally:
         db.close()
+
+
+def test_pipeline_claim_requires_node_capability(app_client):
+    client, SessionLocal = app_client
+    token = _register(client, "capability-node", ["tts"])
+    pid = client.post("/api/projects", headers=ADMIN,
+                      json={"name": "claim gate", "target_lang": "en"}).json()["id"]
+    db = SessionLocal()
+    try:
+        from app.db.models import PipelineTask
+        db.add_all([
+            PipelineTask(project_id=pid, task_key="DIARIZE/cap", task_type="diarize",
+                         resource="gpu", gpu_required=True, status="pending"),
+            PipelineTask(project_id=pid, task_key="TTS/cap", task_type="tts-generate",
+                         resource="gpu", gpu_required=True, status="pending"),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    claimed = client.get("/api/nodes/me/claim", headers={"Authorization": f"Bearer {token}"})
+    assert claimed.status_code == 200
+    assert claimed.json()["task"]["task_type"] == "tts-generate"
 
 
 def test_management_auth_and_submit(app_client):

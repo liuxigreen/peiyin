@@ -81,7 +81,10 @@ def test_complete_then_vocals_artifact_creates_authenticated_url(tmp_path, monke
         db.close()
 
     assert client.get(url, headers={"Authorization": "Bearer foreign"}).status_code == 403
-    claimed = client.get("/api/nodes/me/claim", headers={"Authorization": "Bearer diarize-node"})
+    diarize_headers = {"Authorization": "Bearer diarize-node"}
+    assert client.post("/api/nodes/heartbeat", headers=diarize_headers,
+                       json={"capabilities": ["diarize"]}).status_code == 200
+    claimed = client.get("/api/nodes/me/claim", headers=diarize_headers)
     assert claimed.status_code == 200, claimed.text
     assert claimed.json()["task"]["id"] == handoff.id
     downloaded = client.get(url, headers={"Authorization": "Bearer diarize-node"})

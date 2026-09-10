@@ -94,6 +94,10 @@ def task_heartbeat(task_id: str, authorization: str = Header(default=""),
 CLAIM_PG = """UPDATE pipeline_tasks SET status='running', claimed_by=:node_id,
     lease_until=NOW() + INTERVAL '10 minutes', heartbeat_at=NOW()
 WHERE id = (SELECT t.id FROM pipeline_tasks t WHERE t.status='pending'
+    AND (t.task_type NOT IN ('diarize','separate-vocals','tts-generate')
+         OR (t.task_type='diarize' AND :can_diarize=1)
+         OR (t.task_type='separate-vocals' AND :can_sep=1)
+         OR (t.task_type='tts-generate' AND :can_tts=1))
     AND NOT EXISTS (
       SELECT 1 FROM pipeline_tasks d, json_array_elements_text(
         COALESCE(t.depends_on, '[]'::json)) AS dep(key)
@@ -108,6 +112,10 @@ CLAIM_LITE = """UPDATE pipeline_tasks SET status='running', claimed_by=:nid,
 WHERE id = (SELECT id FROM (
       SELECT id, task_key, depends_on, priority, created_at, project_id
       FROM pipeline_tasks WHERE status='pending'
+        AND (task_type NOT IN ('diarize','separate-vocals','tts-generate')
+             OR (task_type='diarize' AND :can_diarize=1)
+             OR (task_type='separate-vocals' AND :can_sep=1)
+             OR (task_type='tts-generate' AND :can_tts=1))
       ORDER BY priority DESC, created_at ASC LIMIT 50) t
     WHERE NOT EXISTS (
       SELECT 1 FROM json_each(COALESCE(t.depends_on, json('[]'))) dep
@@ -116,6 +124,15 @@ WHERE id = (SELECT id FROM (
       WHERE up.status <> 'completed')
     ORDER BY t.priority DESC, t.created_at ASC LIMIT 1)
 RETURNING *"""
+
+
+def _claim_capability_params(node: m.GpuNode) -> dict[str, int]:
+    capabilities = set(node.capabilities or [])
+    return {
+        "can_diarize": int("diarize" in capabilities),
+        "can_sep": int("sep" in capabilities),
+        "can_tts": int("tts" in capabilities),
+    }
 
 @router.get("/me/claim")
 def claim(capabilities: str = "", model: str | None = None, n: int = 1,
@@ -128,10 +145,12 @@ def claim(capabilities: str = "", model: str | None = None, n: int = 1,
     sql = CLAIM_PG if is_pg else CLAIM_LITE
     n = max(1, min(int(n or 1), 32))
     tasks = []
+    capability_params = _claim_capability_params(node)
     with engine.begin() as conn:
         for _ in range(n):
             row = conn.execute(satext(sql),
-                               {"nid": node.id, "node_id": node.id}).mappings().first()
+                               {"nid": node.id, "node_id": node.id,
+                                **capability_params}).mappings().first()
             if not row:
                 break
             task = dict(row)
