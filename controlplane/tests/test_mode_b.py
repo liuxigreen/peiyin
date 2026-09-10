@@ -1,4 +1,4 @@
-"""模式B端到端测试：字幕+中文配音 → 交付包（mock TTS + live翻译链mock provider）"""
+"""模式 B 主流程测试：混音输入只能进入真实 GPU 克隆链。"""
 import importlib
 import os
 
@@ -31,7 +31,7 @@ def _make_zh_audio(path: str, dur_s: float = 8.0, sr: int = 16000):
     sf.write(path, (0.4 * np.sin(2 * np.pi * 280 * t)).astype(np.float32), sr)
 
 
-def test_mode_b_e2e(tmp_path):
+def test_mode_b_audio_starts_separation_without_mock_delivery(tmp_path):
     c = _client(str(tmp_path / "mb.db"))
     pid = c.post("/api/projects", json={
         "name": "模式B剧", "target_lang": "en"}).json()["id"]
@@ -43,26 +43,15 @@ def test_mode_b_e2e(tmp_path):
     r = c.post(f"/api/projects/{pid}/mode-b/upload-audio",
                json={"audio_path": audio}).json()
     assert r["ok"]
-    # 跑模式B
+    # 有中文配音时，主流程只创建真实的分离任务；不能回退生成 mock TTS 或交付包。
     r = c.post(f"/api/projects/{pid}/mode-b/run").json()
     assert r["ok"], r
-    assert r["clips"] == 2
     assert r["mode"] == "B"
-    # 交付包存在且结构完整
-    pkg = c.get(f"/api/projects/{pid}/mode-b/package").json()
-    assert pkg["ok"]
-    import zipfile
-    z = zipfile.ZipFile(pkg["file"])
-    names = z.namelist()
-    assert any(n.endswith(".srt") for n in names), names
-    assert any(n.endswith(".ass") for n in names)
-    assert "manifest.json" in names and "qc_report.json" in names
-    audio_files = [n for n in names if n.startswith("audio/")]
-    assert len(audio_files) == 2
-    # manifest含译文
-    import json as J
-    man = J.loads(z.read("manifest.json"))
-    assert all(c["text"] for c in man["clips"])
+    assert r["phase"] == "separate"
+    assert r["task_id"]
+    assert "真实克隆链路" in r["note"]
+    pkg = c.get(f"/api/projects/{pid}/mode-b/package")
+    assert pkg.status_code == 404
 
 
 def test_mode_b_pure_translate_without_audio(tmp_path):
