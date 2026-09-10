@@ -157,7 +157,12 @@ def build_package_from_clips(project: dict, rows: list[dict], out_dir: str,
         from app.audio_post import condition_line, make_breath, master_mix
         aud_dir = os.path.join(out_dir, "audio")
         os.makedirs(aud_dir, exist_ok=True)
-        breath = make_breath(os.path.join(out_dir, "breath.wav"))
+        try:
+            breath = make_breath(os.path.join(out_dir, "breath.wav"))
+        except Exception as e:                                   # noqa: BLE001
+            # Breath is optional polish. A missing ffmpeg must not prevent delivery.
+            breath = None
+            post_errors.append({"uid": "BREATH", "err": str(e)[:160]})
         kept = [r for r in rows if r.get("audio_path")]
         for r in kept:
             try:
