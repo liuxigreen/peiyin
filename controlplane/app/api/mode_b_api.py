@@ -469,6 +469,65 @@ def create_diarize_task(pid: str, body: dict, db: Session = Depends(get_db)):
             "note": "节点跑完回传 diarize_result.json"}
 
 
+@router.post("/projects/{pid}/mode-b/diarize/retry")
+def retry_dead_diarize_task(pid: str, body: dict, db: Session = Depends(get_db)):
+    """Explicitly retry one dead artifact-backed diarize task for a small canary."""
+    project = db.get(Project, pid)
+    if not project:
+        raise HTTPException(404)
+    task_id = body.get("task_id")
+    uids = body.get("uids")
+    if not isinstance(task_id, str) or not isinstance(uids, list):
+        raise HTTPException(400, "task_id and uids are required")
+    if not 10 <= len(uids) <= 20 or any(not isinstance(uid, str) for uid in uids):
+        raise HTTPException(400, "uids must contain 10 to 20 strings")
+    if len(set(uids)) != len(uids):
+        raise HTTPException(400, "uids must be unique")
+
+    task = db.get(PipelineTask, task_id)
+    if not task or task.project_id != pid or task.task_type != "diarize":
+        raise HTTPException(404)
+    utterances = (db.query(Utterance)
+                    .filter(Utterance.project_id == pid, Utterance.uid.in_(uids))
+                    .all())
+    by_uid = {utterance.uid: utterance for utterance in utterances}
+    if len(by_uid) != len(uids):
+        raise HTTPException(400, "uids must belong to the project")
+
+    outputs = task.output_paths if isinstance(task.output_paths, dict) else {}
+    payload = outputs.get("payload") if isinstance(outputs.get("payload"), dict) else {}
+    artifact_url = payload.get("zh_audio_url")
+    if (not isinstance(artifact_url, str)
+            or not artifact_url.startswith("/api/nodes/tasks/")
+            or "/artifacts/" not in artifact_url):
+        raise HTTPException(409, "diarize task does not reference a control-plane artifact")
+
+    if task.status == "pending":
+        return {"ok": True, "task_id": task.id, "slots": len(uids), "idempotent": True}
+    if task.status != "dead":
+        raise HTTPException(409, f"diarize task is {task.status}, not dead")
+
+    slots = [{"uid": uid, "start_ms": by_uid[uid].start_ms, "end_ms": by_uid[uid].end_ms}
+             for uid in uids]
+    next_payload = dict(payload)
+    next_payload["srt_slots"] = slots
+    next_outputs = dict(outputs)
+    next_outputs["payload"] = next_payload
+    config = dict(project.config or {})
+    run_config = dict(config.get("mode_b_run") or {})
+    run_config["canary_uids"] = list(uids)
+    config["mode_b_run"] = run_config
+
+    task.status = "pending"
+    task.claimed_by = None
+    task.lease_until = None
+    task.retry_count += 1
+    task.output_paths = next_outputs
+    project.config = config
+    db.commit()
+    return {"ok": True, "task_id": task.id, "slots": len(slots), "idempotent": False}
+
+
 @router.post("/projects/{pid}/bind-speakers")
 async def bind_speakers_ep(pid: str, body: dict = None, db: Session = Depends(get_db)):
     """LLM文本绑定：每句台词→说话角色（utterances.speaker_id）。
