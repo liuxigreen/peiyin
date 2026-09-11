@@ -146,18 +146,36 @@ def test_grant_rejects_wrong_node_and_expiry_without_source_mutation(tmp_path, m
                   "output_paths": copy.deepcopy(db.get(PipelineTask, task_id).output_paths)}
     finally:
         db.close()
-    for token, grant_id in ((other_token, valid_grant), (target_token, expired_grant)):
+    responses = {}
+    for label, token, grant_id in (("wrong_node", other_token, valid_grant),
+                                   ("expired", target_token, expired_grant)):
         response = client.post(f"/api/nodes/tasks/{task_id}/artifact-backfill",
                                headers={"Authorization": f"Bearer {token}"},
                                params={"grant_id": grant_id, "key": "vocals", "filename": "vocals.wav"},
                                content=b"blocked")
         assert response.status_code == 409, response.text
+        responses[label] = response
+    mismatch = responses["wrong_node"].json()["detail"]
+    assert mismatch["code"] == "backfill_grant_node_mismatch"
+    assert mismatch["expected_node_id"] == target_id
+    assert mismatch["authenticated_node_id"] != target_id
+    assert responses["expired"].json()["detail"] == "backfill grant has expired"
     db = SessionLocal()
     try:
         task = db.get(PipelineTask, task_id)
         assert {**_lifecycle(task), "output_paths": task.output_paths} == before
     finally:
         db.close()
+
+
+def test_node_identity_preflight_reports_the_authenticated_node(tmp_path, monkeypatch):
+    client, SessionLocal = _client(tmp_path, monkeypatch)
+    token = "preflight-token"
+    node_id = _node(client, SessionLocal, token)
+    response = client.get("/api/nodes/me", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == node_id
+    assert response.json()["token_hash_prefix"] == hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
 def test_original_owner_needs_no_grant(tmp_path, monkeypatch):

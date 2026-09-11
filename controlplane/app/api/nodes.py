@@ -51,6 +51,23 @@ def _auth_node(db: Session, authorization: str) -> m.GpuNode:
         node.online = True; db.commit()
     return node
 
+
+@router.get("/me")
+def node_identity(authorization: str = Header(default=""),
+                  db: Session = Depends(get_db)):
+    """Return the non-secret identity selected by a node bearer token.
+
+    This gives node-side maintenance tools a deterministic preflight before a
+    one-time operation.  It deliberately never returns the bearer token or its
+    complete hash.
+    """
+    node = _auth_node(db, authorization)
+    return {
+        "id": node.id,
+        "name": node.name,
+        "token_hash_prefix": (node.token_hash or "")[:16],
+    }
+
 @router.post("/heartbeat")
 def heartbeat(body: dict | None = None, authorization: str = Header(default=""),
               db: Session = Depends(get_db)):
@@ -414,10 +431,23 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
         grant = db.get(m.LegacyArtifactBackfillGrant, grant_id)
         now = datetime.now(timezone.utc)
         expires_at = _as_utc(grant.expires_at) if grant else None
-        if (grant is None or grant.source_task_id != task.id or grant.node_id != node.id
-                or grant.artifact_key != "vocals" or key != "vocals"
-                or grant.state != "issued" or expires_at is None or expires_at <= now):
-            raise HTTPException(409, "invalid, expired, or consumed backfill grant")
+        if grant is None:
+            raise HTTPException(409, "unknown backfill grant")
+        if grant.source_task_id != task.id or grant.artifact_key != "vocals" or key != "vocals":
+            raise HTTPException(409, "backfill grant does not match this artifact")
+        if grant.node_id != node.id:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "backfill_grant_node_mismatch",
+                    "authenticated_node_id": node.id,
+                    "expected_node_id": grant.node_id,
+                },
+            )
+        if grant.state != "issued":
+            raise HTTPException(409, "backfill grant is already in use or consumed")
+        if expires_at is None or expires_at <= now:
+            raise HTTPException(409, "backfill grant has expired")
         # Reserve before receiving bytes.  A second request cannot overwrite the
         # artifact while this one is in flight; a failed stream releases it below.
         grant.state = "uploading"
