@@ -208,6 +208,15 @@ def _safe_artifact_token(value: str) -> bool:
     return bool(_ART_TOKEN_RE.fullmatch(value)) and ".." not in value
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Normalize sqlite's naive datetimes before comparing with an aware clock."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _artifact_url(task_id: str, key: str, filename: str) -> str:
     return f"/api/nodes/tasks/{task_id}/artifacts/{key}/{filename}"
 
@@ -380,21 +389,44 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
 
 @router.post("/tasks/{task_id}/artifact-backfill")
 async def backfill_separation_artifact(task_id: str, request: "Request", filename: str = "",
-                                       key: str = "", authorization: str = Header(default=""),
+                                       key: str = "", grant_id: str = "",
+                                       authorization: str = Header(default=""),
                                        db: Session = Depends(get_db)):
-    """Let the original node backfill a completed separation artifact without rerunning it."""
+    """Backfill completed separation audio, with a short-lived operator grant if needed."""
     node = _auth_node(db, authorization)
     task = db.get(m.PipelineTask, task_id)
     if not task:
         raise HTTPException(404)
     if task.task_type != "separate-vocals" or task.status != "completed":
         raise HTTPException(409, "artifact backfill requires a completed separation task")
-    if task.claimed_by != node.id:
-        raise HTTPException(409, "task was not completed by this node")
     if key not in {"vocals", "accompaniment"}:
         raise HTTPException(400, "backfill key must be vocals or accompaniment")
     if (not _TASK_ID_RE.fullmatch(task_id) or not _safe_artifact_token(filename)):
         raise HTTPException(400, "invalid artifact key or filename")
+
+    # The historical owner remains fully backward compatible.  A re-registered
+    # node gets no ownership inference: it must present an ECS-issued grant for
+    # this exact source task, node row, and the only allowed legacy key.
+    grant = None
+    if task.claimed_by != node.id:
+        if not grant_id:
+            raise HTTPException(409, "task was not completed by this node")
+        grant = db.get(m.LegacyArtifactBackfillGrant, grant_id)
+        now = datetime.now(timezone.utc)
+        expires_at = _as_utc(grant.expires_at) if grant else None
+        if (grant is None or grant.source_task_id != task.id or grant.node_id != node.id
+                or grant.artifact_key != "vocals" or key != "vocals"
+                or grant.state != "issued" or expires_at is None or expires_at <= now):
+            raise HTTPException(409, "invalid, expired, or consumed backfill grant")
+        # Reserve before receiving bytes.  A second request cannot overwrite the
+        # artifact while this one is in flight; a failed stream releases it below.
+        grant.state = "uploading"
+        grant.attempt_count += 1
+        grant.last_attempt_at = now
+        grant.result = "uploading"
+        grant.result_detail = None
+        reserved_grant_id = grant.id
+        db.commit()
 
     storage = os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
     dest_dir = os.path.join(storage, "artifacts", task_id)
@@ -413,6 +445,14 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
     except Exception:
         if os.path.exists(temporary):
             os.remove(temporary)
+        if grant is not None:
+            db.rollback()
+            grant = db.get(m.LegacyArtifactBackfillGrant, reserved_grant_id)
+            if grant is not None and grant.state == "uploading":
+                grant.state = "issued"
+                grant.result = "upload_failed"
+                grant.result_detail = "artifact stream failed"
+                db.commit()
         raise
 
     entry = {"key": key, "filename": filename, "path": dest, "bytes": size}
@@ -423,6 +463,16 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
     outputs["artifacts"] = artifacts
     task.output_paths = outputs
     _queue_diarize_handoff(db, task)
+    if grant is not None:
+        # The source task lifecycle is intentionally untouched.  Consumption is
+        # recorded only after the artifact has reached control-plane storage.
+        grant.state = "consumed"
+        grant.consumed_by_node_id = node.id
+        grant.consumed_at = datetime.now(timezone.utc)
+        grant.filename = filename
+        grant.byte_count = size
+        grant.result = "uploaded"
+        grant.result_detail = None
     db.commit()
     return {"ok": True, "artifact": entry}
 

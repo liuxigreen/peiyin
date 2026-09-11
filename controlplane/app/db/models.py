@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (String, Integer, Float, Boolean, DateTime, Text, JSON,
-                        ForeignKey, UniqueConstraint, Index, func)
+                        ForeignKey, UniqueConstraint, Index, CheckConstraint, func)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase): pass
@@ -174,6 +174,43 @@ class GpuNode(Base):
     online: Mapped[bool] = mapped_column(Boolean, default=True)
     last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class LegacyArtifactBackfillGrant(Base):
+    """A short-lived, operator-issued exception for one legacy vocals upload.
+
+    The grant is deliberately bound to database IDs, rather than a node name or
+    hardware claim.  It records its full one-time consumption lifecycle without
+    changing the historical pipeline task ownership.
+    """
+    __tablename__ = "legacy_artifact_backfill_grants"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    source_task_id: Mapped[str] = mapped_column(
+        ForeignKey("pipeline_tasks.id", ondelete="RESTRICT"), nullable=False)
+    node_id: Mapped[str] = mapped_column(
+        ForeignKey("gpu_nodes.id", ondelete="RESTRICT"), nullable=False)
+    artifact_key: Mapped[str] = mapped_column(String(20), default="vocals")
+    state: Mapped[str] = mapped_column(String(20), default="issued")
+    issuer: Mapped[str] = mapped_column(String(200))
+    issued_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    result: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    result_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consumed_by_node_id: Mapped[str | None] = mapped_column(
+        ForeignKey("gpu_nodes.id", ondelete="RESTRICT"), nullable=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    byte_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    __table_args__ = (
+        CheckConstraint("artifact_key = 'vocals'", name="ck_legacy_backfill_grant_vocals"),
+        CheckConstraint("state IN ('issued', 'uploading', 'consumed')",
+                        name="ck_legacy_backfill_grant_state"),
+        CheckConstraint("expires_at > issued_at", name="ck_legacy_backfill_grant_expiry"),
+        Index("idx_legacy_backfill_grant_consume", "node_id", "state", "expires_at"),
+        Index("idx_legacy_backfill_grant_source", "source_task_id", "artifact_key"),
+    )
 
 class TranslationProvider(Base):
     __tablename__ = "translation_providers"

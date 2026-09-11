@@ -188,3 +188,30 @@ CREATE TABLE IF NOT EXISTS prompt_templates (
     is_default BOOLEAN DEFAULT FALSE,
     effect_score FLOAT
 );
+
+-- 一次性历史 separation vocals 回填授权。签发由 ECS 本地命令完成，节点只消费。
+CREATE TABLE IF NOT EXISTS legacy_artifact_backfill_grants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_task_id UUID NOT NULL REFERENCES pipeline_tasks(id) ON DELETE RESTRICT,
+    node_id UUID NOT NULL REFERENCES gpu_nodes(id) ON DELETE RESTRICT,
+    artifact_key VARCHAR(20) NOT NULL DEFAULT 'vocals',
+    state VARCHAR(20) NOT NULL DEFAULT 'issued',
+    issuer VARCHAR(200) NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TIMESTAMPTZ,
+    result VARCHAR(50),
+    result_detail TEXT,
+    consumed_by_node_id UUID REFERENCES gpu_nodes(id) ON DELETE RESTRICT,
+    consumed_at TIMESTAMPTZ,
+    filename VARCHAR(120),
+    byte_count INTEGER,
+    CONSTRAINT ck_legacy_backfill_grant_vocals CHECK (artifact_key = 'vocals'),
+    CONSTRAINT ck_legacy_backfill_grant_state CHECK (state IN ('issued', 'uploading', 'consumed')),
+    CONSTRAINT ck_legacy_backfill_grant_expiry CHECK (expires_at > issued_at)
+);
+CREATE INDEX IF NOT EXISTS idx_legacy_backfill_grant_consume
+    ON legacy_artifact_backfill_grants(node_id, state, expires_at);
+CREATE INDEX IF NOT EXISTS idx_legacy_backfill_grant_source
+    ON legacy_artifact_backfill_grants(source_task_id, artifact_key);
