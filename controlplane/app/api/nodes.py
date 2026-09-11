@@ -378,6 +378,55 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
     return {"ok": True, "artifact": entry, "tts_clip": clip_info}
 
 
+@router.post("/tasks/{task_id}/artifact-backfill")
+async def backfill_separation_artifact(task_id: str, request: "Request", filename: str = "",
+                                       key: str = "", authorization: str = Header(default=""),
+                                       db: Session = Depends(get_db)):
+    """Let the original node backfill a completed separation artifact without rerunning it."""
+    node = _auth_node(db, authorization)
+    task = db.get(m.PipelineTask, task_id)
+    if not task:
+        raise HTTPException(404)
+    if task.task_type != "separate-vocals" or task.status != "completed":
+        raise HTTPException(409, "artifact backfill requires a completed separation task")
+    if task.claimed_by != node.id:
+        raise HTTPException(409, "task was not completed by this node")
+    if key not in {"vocals", "accompaniment"}:
+        raise HTTPException(400, "backfill key must be vocals or accompaniment")
+    if (not _TASK_ID_RE.fullmatch(task_id) or not _safe_artifact_token(filename)):
+        raise HTTPException(400, "invalid artifact key or filename")
+
+    storage = os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+    dest_dir = os.path.join(storage, "artifacts", task_id)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, filename)
+    temporary = dest + ".backfill"
+    size = 0
+    try:
+        with open(temporary, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > _ART_MAX_MB << 20:
+                    raise HTTPException(413, f"artifact exceeds {_ART_MAX_MB}MB")
+                f.write(chunk)
+        os.replace(temporary, dest)
+    except Exception:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise
+
+    entry = {"key": key, "filename": filename, "path": dest, "bytes": size}
+    outputs = dict(task.output_paths or {})
+    artifacts = [artifact for artifact in (outputs.get("artifacts") or [])
+                 if artifact.get("key") != key]
+    artifacts.append(entry)
+    outputs["artifacts"] = artifacts
+    task.output_paths = outputs
+    _queue_diarize_handoff(db, task)
+    db.commit()
+    return {"ok": True, "artifact": entry}
+
+
 @router.get("/tasks/{task_id}/artifacts/{key}/{filename}")
 def download_artifact(task_id: str, key: str, filename: str,
                       authorization: str = Header(default=""),
