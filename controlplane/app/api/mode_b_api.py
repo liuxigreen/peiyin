@@ -10,11 +10,21 @@ from sqlalchemy.orm import Session
 from ..db.models import Project, Translation, Utterance, PipelineTask
 from ..db.session import get_db
 from ..mode_b import audio_slots, build_package, tts_clips_mock
+from ..mode_b_reconciler import inspect_mode_b_run
 from ..translate_executor import run_translate_scene
 
 router = APIRouter(prefix="/api", tags=["mode-b"])
 
 STORAGE = os.getenv("MODE_B_STORAGE", "/tmp/peiyin-mode-b")
+
+
+@router.get("/projects/{pid}/mode-b/status")
+def mode_b_status(pid: str, db: Session = Depends(get_db)):
+    """Return persisted Mode B progress without dispatching or mutating work."""
+    project = db.get(Project, pid)
+    if not project:
+        raise HTTPException(404)
+    return inspect_mode_b_run(db, project)
 
 
 @router.post("/projects/{pid}/mode-b/upload-audio")
