@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import pathlib
 import types
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -30,10 +31,15 @@ class FakeHTTP:
         self.get_responses = list(get_responses or [])
         self.post_calls = []
         self.get_calls = []
+        self.upload_bodies = []
 
     def post(self, url, **kwargs):
         self.post_calls.append((url, kwargs))
-        return self.post_responses.pop(0) if self.post_responses else FakeResponse({})
+        response = self.post_responses.pop(0) if self.post_responses else FakeResponse({})
+        content = kwargs.get("content")
+        if content is not None:
+            self.upload_bodies.append(b"".join(content))
+        return response
 
     def get(self, url, **kwargs):
         self.get_calls.append((url, kwargs))
@@ -149,6 +155,158 @@ def test_probe_execution_error_is_failed_and_retryable(monkeypatch):
         "error": "OSError: disk temporarily unavailable",
         "retryable": True,
     }
+
+
+def _legacy_job(source_path, **overrides):
+    job = {
+        "id": "job-legacy-1",
+        "target_node_id": "node-1",
+        "kind": "legacy-vocals-backfill",
+        "spec_version": "1",
+        "claimed_by": "node-1",
+        "params": {
+            "source_task_id": "task-legacy-1",
+            "source_path": str(source_path),
+            "key": "vocals",
+            "filename": "vocals.wav",
+        },
+    }
+    job.update(overrides)
+    return job
+
+
+def _legacy_http(job, *, upload_body=None, get_body=None, extra_posts=None):
+    artifact = {"key": "vocals", "filename": "vocals.wav", "bytes": 0}
+    if upload_body is not None:
+        artifact["bytes"] = len(upload_body)
+    responses = [
+        FakeResponse({"job": job}),
+        FakeResponse({"ok": True}),
+        FakeResponse({"ok": True, "artifact": artifact}),
+    ]
+    if extra_posts:
+        responses.extend(extra_posts)
+    responses.append(FakeResponse({"ok": True}))
+    return FakeHTTP(
+        post_responses=responses,
+        get_responses=[FakeResponse(get_body or {"id": "node-1"})],
+    )
+
+
+def test_legacy_job_claims_identity_heartbeats_streams_and_completes(tmp_path):
+    source = tmp_path / "vocals.wav"
+    content = b"v" * (node_jobs.legacy_artifact_backfill.CHUNK_BYTES + 17)
+    source.write_bytes(content)
+    job = _legacy_job(source)
+    http = _legacy_http(job, upload_body=content)
+
+    result = node_jobs.run_one(http, "http://control.example", "resident-token")
+
+    assert result["status"] == "completed"
+    assert result["result"] == {
+        "artifact": {"key": "vocals", "filename": "vocals.wav", "bytes": len(content)}
+    }
+    assert http.upload_bodies == [content]
+    assert [call[0] for call in http.post_calls] == [
+        "http://control.example/api/nodes/jobs/claim",
+        "http://control.example/api/nodes/jobs/job-legacy-1/heartbeat",
+        "http://control.example/api/nodes/tasks/task-legacy-1/artifact-backfill?job_id=job-legacy-1&key=vocals&filename=vocals.wav",
+        "http://control.example/api/nodes/jobs/job-legacy-1/complete",
+    ]
+    assert http.get_calls[0][0] == "http://control.example/api/nodes/me"
+    for _url, kwargs in [*http.post_calls, *http.get_calls]:
+        assert kwargs["headers"]["Authorization"] == "Bearer resident-token"
+    query = parse_qs(urlparse(http.post_calls[2][0]).query)
+    assert query == {"job_id": ["job-legacy-1"], "key": ["vocals"], "filename": ["vocals.wav"]}
+    assert "resident-token" not in json.dumps(result)
+
+
+def test_legacy_identity_mismatch_fails_before_opening_or_uploading(monkeypatch, tmp_path):
+    source = tmp_path / "vocals.wav"
+    source.write_bytes(b"must-not-be-read")
+    job = _legacy_job(source)
+    http = FakeHTTP(
+        post_responses=[FakeResponse({"job": job}), FakeResponse({"ok": True})],
+        get_responses=[FakeResponse({"id": "other-node"})],
+    )
+
+    def fail_open(*_args, **_kwargs):
+        pytest.fail("identity mismatch must not open source")
+
+    monkeypatch.setattr(pathlib.Path, "open", fail_open)
+    result = node_jobs.run_one(http, "http://control.example", "resident-token")
+
+    assert result["status"] == "failed"
+    assert result["retryable"] is False
+    assert http.upload_bodies == []
+    assert [call[0] for call in http.post_calls] == [
+        "http://control.example/api/nodes/jobs/claim",
+        "http://control.example/api/nodes/jobs/job-legacy-1/fail",
+    ]
+    assert "resident-token" not in json.dumps(result)
+
+
+def test_legacy_invalid_params_are_non_retryable_and_do_not_read_source(tmp_path):
+    source = tmp_path / "vocals.wav"
+    source.write_bytes(b"must-not-be-read")
+    job = _legacy_job(source, params={
+        "source_task_id": ["task-legacy-1"],
+        "source_path": str(source),
+        "key": "vocals",
+        "filename": "vocals.wav",
+    })
+    http = FakeHTTP(
+        post_responses=[FakeResponse({"job": job}), FakeResponse({"ok": True})]
+    )
+
+    result = node_jobs.run_one(http, "http://control.example", "resident-token")
+
+    assert result["status"] == "failed"
+    assert result["retryable"] is False
+    assert http.get_calls == []
+    assert http.upload_bodies == []
+
+
+def test_legacy_upload_io_error_is_retryable(monkeypatch, tmp_path):
+    source = tmp_path / "vocals.wav"
+    source.write_bytes(b"chunk")
+    job = _legacy_job(source)
+    http = _legacy_http(job, upload_body=b"chunk")
+
+    def fail_after_open(_source, **_kwargs):
+        raise OSError("temporary read failure")
+
+    monkeypatch.setattr(node_jobs.legacy_artifact_backfill, "iter_file_chunks", fail_after_open)
+    result = node_jobs.run_one(http, "http://control.example", "resident-token")
+
+    assert result["status"] == "failed"
+    assert result["retryable"] is True
+    fail_body = http.post_calls[-1][1]["json"]
+    assert fail_body["retryable"] is True
+    assert "resident-token" not in json.dumps(fail_body)
+
+
+def test_legacy_heartbeat_renews_during_chunked_upload(monkeypatch, tmp_path):
+    source = tmp_path / "vocals.wav"
+    content = b"v" * 7
+    source.write_bytes(content)
+    job = _legacy_job(source)
+    http = _legacy_http(
+        job,
+        upload_body=content,
+        extra_posts=[FakeResponse({"ok": True})],
+    )
+    clock = iter([0.0, 31.0, 31.0])
+    monkeypatch.setattr(node_jobs.time, "monotonic", lambda: next(clock))
+
+    result = node_jobs.run_one(http, "http://control.example", "resident-token")
+
+    assert result["status"] == "completed"
+    heartbeat_urls = [
+        url for url, _kwargs in http.post_calls if url.endswith("/heartbeat")
+    ]
+    assert len(heartbeat_urls) == 2
+    assert http.upload_bodies == [content]
 
 
 def test_collect_probe_uses_only_expected_stdlib_facts(monkeypatch, tmp_path):

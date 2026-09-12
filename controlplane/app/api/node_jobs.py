@@ -17,15 +17,19 @@ from sqlalchemy.orm import Session
 
 from ..db import models as m
 from ..db.session import get_db
-from .nodes import _auth_node
+from .nodes import _auth_node, _queue_diarize_handoff
 
 
 LEASE_MINUTES = 10
 RESULT_MAX_BYTES = 1024
 ERROR_MAX_CHARS = 500
-ALLOWED_KINDS = frozenset({"probe"})
-# 便于调用方和测试按语义名称导入；白名单仍只有 probe。
-NODE_JOB_KINDS = ALLOWED_KINDS
+PROBE_KIND = "probe"
+LEGACY_VOCALS_BACKFILL_KIND = "legacy-vocals-backfill"
+LEGACY_VOCALS_BACKFILL_SPEC_VERSION = "1"
+ALLOWED_KINDS = frozenset({PROBE_KIND})
+# The generic endpoint remains probe-only.  The special legacy protocol is
+# created through its constrained endpoint below.
+NODE_JOB_KINDS = frozenset({PROBE_KIND, LEGACY_VOCALS_BACKFILL_KIND})
 
 
 def _require_admin(authorization: str = Header(default="")) -> None:
@@ -130,6 +134,7 @@ def _create_values(body: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "target_node_name": target,
+        "target_node_id": None,
         "kind": kind,
         "spec_version": spec_version,
         "params": params,
@@ -146,6 +151,7 @@ def _job_payload(job: m.NodeJob) -> dict[str, Any]:
     return {
         "id": job.id,
         "target_node_name": job.target_node_name,
+        "target_node_id": job.target_node_id,
         "kind": job.kind,
         "spec_version": job.spec_version,
         "params": job.params,
@@ -168,6 +174,58 @@ def _job_payload(job: m.NodeJob) -> dict[str, Any]:
 def create_job(body: dict[str, Any], db: Session = Depends(get_db)):
     values = _create_values(body)
     job = m.NodeJob(**values)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return _job_payload(job)
+
+
+def _legacy_vocals_source(task: m.PipelineTask) -> str:
+    if task.task_type != "separate-vocals" or task.status != "completed":
+        raise HTTPException(409, detail="source task must be a completed separation task")
+    outputs = dict(task.output_paths or {})
+    if any(isinstance(item, dict) and item.get("key") == "vocals"
+           for item in (outputs.get("artifacts") or [])):
+        raise HTTPException(409, detail="source task already has a vocals artifact")
+    matches = [item for item in (outputs.get("outputs") or [])
+               if isinstance(item, dict) and item.get("key") == "vocals"]
+    if len(matches) != 1:
+        _validation_error("source task must declare exactly one vocals output")
+    source_path = matches[0].get("path")
+    if not isinstance(source_path, str) or not source_path.strip():
+        _validation_error("source vocals output path is required")
+    return source_path
+
+
+@router.post("/legacy-vocals-backfill")
+def create_legacy_vocals_backfill_job(
+    body: dict[str, Any], db: Session = Depends(get_db)
+):
+    """Create one exact-node job for one completed legacy source task."""
+    if not isinstance(body, dict):
+        _validation_error("request body must be an object")
+    source_task_id = body.get("source_task_id")
+    target_node_id = body.get("target_node_id")
+    if not isinstance(source_task_id, str) or not source_task_id:
+        _validation_error("source_task_id is required")
+    if not isinstance(target_node_id, str) or not target_node_id:
+        _validation_error("target_node_id is required")
+    target = db.get(m.GpuNode, target_node_id)
+    if target is None:
+        raise HTTPException(404, detail="target node not found")
+    source = db.get(m.PipelineTask, source_task_id)
+    if source is None:
+        raise HTTPException(404, detail="source task not found")
+    source_path = _legacy_vocals_source(source)
+    job = m.NodeJob(
+        target_node_name=target.name,
+        target_node_id=target.id,
+        kind=LEGACY_VOCALS_BACKFILL_KIND,
+        spec_version=LEGACY_VOCALS_BACKFILL_SPEC_VERSION,
+        params={"source_task_id": source.id, "source_path": source_path,
+                "key": "vocals", "filename": "vocals.wav"},
+        max_retries=0,
+    )
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -211,7 +269,8 @@ WHERE id = (
     SELECT id
     FROM node_jobs
     WHERE status = 'pending'
-      AND target_node_name = :target_node_name
+      AND (target_node_id = :node_id
+           OR (target_node_id IS NULL AND target_node_name = :target_node_name))
     ORDER BY created_at ASC, id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -230,12 +289,14 @@ WHERE id = (
     SELECT id
     FROM node_jobs
     WHERE status = 'pending'
-      AND target_node_name = :target_node_name
+      AND (target_node_id = :node_id
+           OR (target_node_id IS NULL AND target_node_name = :target_node_name))
     ORDER BY created_at ASC, id ASC
     LIMIT 1
 )
   AND status = 'pending'
-  AND target_node_name = :target_node_name
+  AND (target_node_id = :node_id
+       OR (target_node_id IS NULL AND target_node_name = :target_node_name))
 RETURNING id
 """
 
@@ -292,6 +353,35 @@ def _owned_job(db: Session, job_id: str, authorization: str) -> tuple[m.NodeJob,
     return job, node
 
 
+def _legacy_vocals_artifact_for_completion(
+    db: Session, job: m.NodeJob, node: m.GpuNode
+) -> m.PipelineTask:
+    """Confirm the durable artifact before this special job can complete."""
+    if (job.kind != LEGACY_VOCALS_BACKFILL_KIND
+            or job.spec_version != LEGACY_VOCALS_BACKFILL_SPEC_VERSION
+            or job.status != "running" or job.claimed_by != node.id
+            or job.target_node_id != node.id):
+        raise HTTPException(409, detail="legacy backfill job is not owned by this node")
+    params = job.params if isinstance(job.params, dict) else {}
+    source_task_id = params.get("source_task_id")
+    if (not isinstance(source_task_id, str) or params.get("key") != "vocals"
+            or params.get("filename") != "vocals.wav"):
+        raise HTTPException(409, detail="legacy backfill job has invalid source")
+    source = db.get(m.PipelineTask, source_task_id)
+    if source is None or source.task_type != "separate-vocals" or source.status != "completed":
+        raise HTTPException(409, detail="legacy backfill source is no longer eligible")
+    artifact = next(
+        (item for item in ((source.output_paths or {}).get("artifacts") or [])
+         if isinstance(item, dict) and item.get("key") == "vocals"
+         and item.get("filename") == "vocals.wav"),
+        None,
+    )
+    artifact_path = artifact.get("path") if artifact else None
+    if not isinstance(artifact_path, str) or not os.path.isfile(artifact_path):
+        raise HTTPException(409, detail="legacy backfill vocals artifact is missing")
+    return source
+
+
 def _apply_checkpoint(job: m.NodeJob, body: dict[str, Any]) -> None:
     if "checkpoint" in body:
         _validate_json_value(body["checkpoint"], "checkpoint")
@@ -305,7 +395,7 @@ def heartbeat_job(
     authorization: str = Header(default=""),
     db: Session = Depends(get_db),
 ):
-    job, _node = _owned_job(db, job_id, authorization)
+    job, node = _owned_job(db, job_id, authorization)
     body = body or {}
     _apply_checkpoint(job, body)
     now = datetime.now(timezone.utc)
@@ -323,15 +413,20 @@ def complete_job(
     authorization: str = Header(default=""),
     db: Session = Depends(get_db),
 ):
-    job, _node = _owned_job(db, job_id, authorization)
+    job, node = _owned_job(db, job_id, authorization)
     body = body or {}
     if "result" in body:
         _validate_result(body["result"])
         job.result = body["result"]
     _apply_checkpoint(job, body)
+    source = None
+    if job.kind == LEGACY_VOCALS_BACKFILL_KIND:
+        source = _legacy_vocals_artifact_for_completion(db, job, node)
     job.status = "completed"
     job.lease_until = None
     job.completed_at = datetime.now(timezone.utc)
+    if source is not None:
+        _queue_diarize_handoff(db, source)
     db.commit()
     db.refresh(job)
     return {"ok": True, "job": _job_payload(job)}

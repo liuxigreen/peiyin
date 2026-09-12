@@ -113,6 +113,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_ready ON pipeline_tasks(status, gpu_require
 CREATE TABLE IF NOT EXISTS node_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     target_node_name VARCHAR(100) NOT NULL,
+    target_node_id UUID,
     kind VARCHAR(50) NOT NULL,
     spec_version VARCHAR(32) NOT NULL DEFAULT '1',
     params JSONB NOT NULL DEFAULT '{}',
@@ -132,6 +133,8 @@ CREATE TABLE IF NOT EXISTS node_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_node_jobs_claim
     ON node_jobs(status, target_node_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_node_jobs_target_id_claim
+    ON node_jobs(status, target_node_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_node_jobs_lease
     ON node_jobs(status, lease_until);
 

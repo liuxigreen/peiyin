@@ -141,6 +141,11 @@ class NodeJob(Base):
     __tablename__ = "node_jobs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     target_node_name: Mapped[str] = mapped_column(String(100))
+    # New backfill jobs bind to a concrete node row.  It stays nullable so
+    # historical name-routed probe jobs retain their existing semantics.
+    target_node_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("gpu_nodes.id", ondelete="RESTRICT"), nullable=True
+    )
     kind: Mapped[str] = mapped_column(String(50))
     spec_version: Mapped[str] = mapped_column(String(32), default="1")
     params: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -160,6 +165,7 @@ class NodeJob(Base):
     )
     __table_args__ = (
         Index("idx_node_jobs_claim", "status", "target_node_name", "created_at"),
+        Index("idx_node_jobs_target_id_claim", "status", "target_node_id", "created_at"),
         Index("idx_node_jobs_lease", "status", "lease_until"),
     )
 

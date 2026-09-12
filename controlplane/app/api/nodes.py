@@ -406,7 +406,7 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
 
 @router.post("/tasks/{task_id}/artifact-backfill")
 async def backfill_separation_artifact(task_id: str, request: "Request", filename: str = "",
-                                       key: str = "", grant_id: str = "",
+                                       key: str = "", grant_id: str = "", job_id: str = "",
                                        authorization: str = Header(default=""),
                                        db: Session = Depends(get_db)):
     """Backfill completed separation audio, with a short-lived operator grant if needed."""
@@ -421,11 +421,39 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
     if (not _TASK_ID_RE.fullmatch(task_id) or not _safe_artifact_token(filename)):
         raise HTTPException(400, "invalid artifact key or filename")
 
+    # Job ownership is an independent one-time authority.  This branch never
+    # falls through to a historical owner or grant check.
+    job = None
+    if job_id:
+        from .node_jobs import (
+            LEGACY_VOCALS_BACKFILL_KIND,
+            LEGACY_VOCALS_BACKFILL_SPEC_VERSION,
+        )
+        job = db.get(m.NodeJob, job_id)
+        params = job.params if job is not None and isinstance(job.params, dict) else {}
+        if (job is None or job.status != "running" or job.claimed_by != node.id
+                or job.target_node_id != node.id
+                or job.kind != LEGACY_VOCALS_BACKFILL_KIND
+                or job.spec_version != LEGACY_VOCALS_BACKFILL_SPEC_VERSION
+                or params.get("source_task_id") != task.id
+                or params.get("key") != "vocals"
+                or params.get("filename") != "vocals.wav"
+                or not isinstance(params.get("source_path"), str)):
+            raise HTTPException(409, "legacy backfill job is not owned by this node")
+        if key != "vocals" or filename != "vocals.wav":
+            raise HTTPException(400, "legacy backfill job requires vocals.wav")
+        declared = [item for item in ((task.output_paths or {}).get("outputs") or [])
+                    if isinstance(item, dict) and item.get("key") == "vocals"]
+        if (len(declared) != 1 or declared[0].get("path") != params["source_path"]
+                or any(isinstance(item, dict) and item.get("key") == "vocals"
+                       for item in ((task.output_paths or {}).get("artifacts") or []))):
+            raise HTTPException(409, "legacy backfill source no longer matches job")
+
     # The historical owner remains fully backward compatible.  A re-registered
     # node gets no ownership inference: it must present an ECS-issued grant for
     # this exact source task, node row, and the only allowed legacy key.
     grant = None
-    if task.claimed_by != node.id:
+    if job is None and task.claimed_by != node.id:
         if not grant_id:
             raise HTTPException(409, "task was not completed by this node")
         grant = db.get(m.LegacyArtifactBackfillGrant, grant_id)
@@ -492,7 +520,12 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
     artifacts.append(entry)
     outputs["artifacts"] = artifacts
     task.output_paths = outputs
-    _queue_diarize_handoff(db, task)
+    if job is not None:
+        # Upload persists only the artifact and a durable checkpoint.  A
+        # consumer appears only when the running job is explicitly completed.
+        job.checkpoint = {"artifact": {"key": key, "filename": filename, "bytes": size}}
+    else:
+        _queue_diarize_handoff(db, task)
     if grant is not None:
         # The source task lifecycle is intentionally untouched.  Consumption is
         # recorded only after the artifact has reached control-plane storage.
