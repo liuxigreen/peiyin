@@ -180,6 +180,14 @@ class GpuNode(Base):
     online: Mapped[bool] = mapped_column(Boolean, default=True)
     last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    release_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    release_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    release_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    release_draining: Mapped[bool] = mapped_column(Boolean, default=False)
+    release_reported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (
+        Index("idx_gpu_nodes_release_state", "release_ready", "release_draining"),
+    )
 
 
 class LegacyArtifactBackfillGrant(Base):

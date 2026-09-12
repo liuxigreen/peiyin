@@ -11,6 +11,13 @@ from ..db.session import get_db
 from ..db import models as m
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
+_RELEASE_VERSION_RE = _re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?")
+_RELEASE_DIGEST_RE = _re.compile(r"[0-9a-f]{64}")
+_RELEASE_MINIMUMS = {
+    "diarize": "NODE_MIN_RELEASE_DIARIZE",
+    "sep": "NODE_MIN_RELEASE_SEP",
+    "tts": "NODE_MIN_RELEASE_TTS",
+}
 
 def _secret_ok(x_node_secret: str) -> bool:
     expected = os.getenv("NODE_SHARED_SECRET", "dev-node-secret")
@@ -52,6 +59,41 @@ def _auth_node(db: Session, authorization: str) -> m.GpuNode:
     return node
 
 
+def _release_payload(node: m.GpuNode) -> dict:
+    return {
+        "version": node.release_version,
+        "digest": node.release_digest,
+        "ready": bool(node.release_ready),
+        "draining": bool(node.release_draining),
+        "reported_at": node.release_reported_at.isoformat() if node.release_reported_at else None,
+    }
+
+
+def _parse_release_version(value: object) -> tuple[int, ...] | None:
+    if not isinstance(value, str) or not _RELEASE_VERSION_RE.fullmatch(value):
+        return None
+    return tuple(int(segment) for segment in value.split(".")) + (0,) * (4 - value.count(".") - 1)
+
+
+def _release_allows(node: m.GpuNode, capability: str) -> bool:
+    """Gate only after an operator explicitly configures a minimum version.
+
+    Deployment order: deploy this compatibility release first, install and
+    report each node's release state, then configure the minimum to activate
+    the strict ready/version gate.  This function never changes queued work.
+    """
+    if capability not in set(node.capabilities or []):
+        return False
+    minimum_raw = os.getenv(_RELEASE_MINIMUMS[capability], "").strip()
+    if not minimum_raw:
+        return True
+    minimum = _parse_release_version(minimum_raw)
+    installed = _parse_release_version(node.release_version)
+    return bool(minimum is not None and installed is not None
+                and node.release_ready and not node.release_draining
+                and installed >= minimum)
+
+
 @router.get("/me")
 def node_identity(authorization: str = Header(default=""),
                   db: Session = Depends(get_db)):
@@ -66,6 +108,54 @@ def node_identity(authorization: str = Header(default=""),
         "id": node.id,
         "name": node.name,
         "token_hash_prefix": (node.token_hash or "")[:16],
+    }
+
+
+@router.post("/me/release-state")
+def release_state(body: dict, authorization: str = Header(default=""),
+                  db: Session = Depends(get_db)):
+    """Persist authenticated release readiness; heartbeat/register cannot set it."""
+    node = _auth_node(db, authorization)
+    required = {"version", "digest", "ready", "draining"}
+    if not isinstance(body, dict) or not required <= set(body):
+        raise HTTPException(422, "version, digest, ready, and draining are required")
+    version, digest = body["version"], body["digest"]
+    ready, draining = body["ready"], body["draining"]
+    if not isinstance(ready, bool) or not isinstance(draining, bool):
+        raise HTTPException(422, "ready and draining must be booleans")
+    if not isinstance(version, str) or len(version) > 32:
+        raise HTTPException(422, "version must be a string of at most 32 characters")
+    if not isinstance(digest, str) or len(digest) > 64:
+        raise HTTPException(422, "digest must be a string of at most 64 characters")
+    empty_release = not version and not digest
+    valid_release = bool(_parse_release_version(version) and _RELEASE_DIGEST_RE.fullmatch(digest))
+    if not (empty_release and not ready) and not valid_release:
+        raise HTTPException(422, "release version and digest must both be empty or both be valid")
+    if ready and draining:
+        raise HTTPException(422, "ready and draining cannot both be true")
+    node.release_version = version or None
+    node.release_digest = digest or None
+    node.release_ready = ready
+    node.release_draining = draining
+    node.release_reported_at = datetime.now(timezone.utc)
+    db.commit()
+    return _release_payload(node)
+
+
+@router.get("/me/release-switch-ready")
+def release_switch_ready(authorization: str = Header(default=""),
+                         db: Session = Depends(get_db)):
+    """Return current ownership counts without changing any task or job."""
+    node = _auth_node(db, authorization)
+    running_pipeline_tasks = db.query(m.PipelineTask).filter_by(
+        claimed_by=node.id, status="running").count()
+    running_node_jobs = db.query(m.NodeJob).filter_by(
+        claimed_by=node.id, status="running").count()
+    return {
+        "ready_to_switch": bool(node.release_draining)
+                           and running_pipeline_tasks == 0 and running_node_jobs == 0,
+        "running_pipeline_tasks": running_pipeline_tasks,
+        "running_node_jobs": running_node_jobs,
     }
 
 @router.post("/heartbeat")
@@ -144,11 +234,10 @@ RETURNING *"""
 
 
 def _claim_capability_params(node: m.GpuNode) -> dict[str, int]:
-    capabilities = set(node.capabilities or [])
     return {
-        "can_diarize": int("diarize" in capabilities),
-        "can_sep": int("sep" in capabilities),
-        "can_tts": int("tts" in capabilities),
+        "can_diarize": int(_release_allows(node, "diarize")),
+        "can_sep": int(_release_allows(node, "sep")),
+        "can_tts": int(_release_allows(node, "tts")),
     }
 
 @router.get("/me/claim")

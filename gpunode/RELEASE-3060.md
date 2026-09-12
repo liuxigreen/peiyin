@@ -1,53 +1,29 @@
-# 3060 节点受控发布清单
+# 3060 受控发布通道
 
-本清单用于将 Windows 3060 节点升级到仓库发布版本。它只发布经过 Git
-确认的节点代码和模型；不要使用 NodeJob 下发代码、计划任务或任意命令。
+此通道一次安装稳定的 `release_channel.py` supervisor，以后从受信任的 HTTPS 发布源取得带 HMAC-SHA256 签名的 manifest。它不修改现有节点入口、模型、工作目录或令牌。
 
-## 发布目标
+## 安装（管理员在 3060 上执行）
 
-- 目标提交：由 Mac 端发布者提供；不得使用未提交的工作树。
-- 目标能力：`tts,asr,sep,diarize`。
-- 目标模型：本地、经 SHA-256 目录摘要校验的
-  `speechbrain/spkrec-ecapa-voxceleb` 快照。
+解压 `node-release-channel-bootstrap-v1.zip`，使用管理员提供的控制面 URL、manifest URL、允许主机列表和一次性 HMAC key 文件运行：
 
-## 节点侧步骤
+```powershell
+.\gpunode\scripts\install_release_channel.ps1 -ControlPlaneUrl 'https://control.example' -ManifestUrl 'https://releases.example/node.manifest.json' -AllowedHost 'releases.example' -HmacKeyFile 'D:\secure\release-hmac.key' -EntryPointPath 'E:\peiyin-node\gpunode\entrypoint.py' -InstallRoot 'E:\peiyin-node\release-channel' -ResidentTaskName 'ExistingHiddenNodeTask'
+```
 
-1. 在 `E:\peiyin-node` 记录当前 Git 提交、`entrypoint.py` 的本地差异和当前
-   任务状态。若存在运行中的 PipelineTask，等待空闲；不要中断 TTS。
-2. 取得指定 Git 提交，仅合并以下仓库文件：
+密钥内容不写入配置、日志或 bootstrap；配置只保存管理员提供的受保护 key file 路径。安装器备份同一个既有隐藏 Scheduled Task 定义、停止旧实例，以 sibling staging 原子替换 supervisor 后复用原任务名；任何失败都会恢复任务定义并重启旧 resident。bootstrap 内含 `bootstrap/current.json` 与 `bootstrap/releases/0.0.0/.release-meta.json` 空 overlay，网络不可用时仍让本地既有入口运行。请在维护窗口执行；本变更没有执行真实部署、下载、计划任务或节点操作。
 
-   - `gpunode/node_jobs.py`
-   - `gpunode/model_inventory.py`
-   - `gpunode/models/manifest.json`
-   - `gpunode/stages/diarize_node.py`
-   - `gpunode/stages/separate_node.py`
-   - `gpunode/stages/engine_manager.py`
-   - `gpunode/entrypoint.py`（保留本机的隐藏启动、NO_PROXY 和引擎管家改动；只合并
-     NodeJob 空闲轮询及“先上传 artifact、后 complete”的逻辑）
+## 构包、签名和发布
 
-   不要覆盖 `entrypoint.ps1`、计划任务或本机密钥配置。
-3. 下载 ECAPA 到节点本地的固定目录（不使用运行时联网下载）。下载完成后，以节点
-   的 Python 计算目录摘要：
+发布者在隔离目录中只列出经审阅的 payload 文件，构包器拒绝 `entrypoint.py`、`workdir`、`models` 和名称包含 token/key/secret 的路径：
 
-   ```powershell
-   python -c "from gpunode.model_inventory import snapshot_sha256; print(snapshot_sha256(r'E:\peiyin-node\models\ecapa-voxceleb'))"
-   ```
+```bash
+python gpunode/scripts/build_node_release.py --source-root . --output-dir out --version 1.2.3 --source-revision <commit> --package-url https://releases.example/node-release-1.2.3.zip --hmac-key-file /secure/release-hmac.key --include gpunode/node_jobs.py
+```
 
-   将实际目录和上一步摘要写入 `gpunode/models/manifest.json` 的
-   `snapshot_path` 与 `snapshot_sha256`。不得提交或上报模型文件、令牌或绝对路径。
-4. 运行本地预检，结果必须为 `ready: true`：
+将 zip 和 manifest 上传到 allowlist 中的 HTTPS 主机。supervisor 先验 HMAC、包 SHA-256 和逐文件 SHA-256，再安全解压到不可变的 `releases/<version>`。
 
-   ```powershell
-   python -m gpunode.model_inventory
-   ```
+## 切换、回滚与离线验证
 
-5. 将节点启动配置中的 `CAPABILITIES` 更新为 `tts,asr,sep,diarize`，重启现有的
-   隐藏常驻启动器。确认不会重新启用旧的每分钟 PowerShell 计划任务。
-6. 等待一次心跳后，从 ECS 核对节点能力已经包含 `diarize`。仅随后才提交一个
-   `probe` NodeJob，确认紧凑结果返回；不要以 probe 安装模型或代码。
+更新前 supervisor 通过 `POST /api/nodes/me/release-state` 报告 draining，并轮询 `GET /api/nodes/me/release-switch-ready`；存在任何运行中的 PipelineTask 或 NodeJob 时不切换。就绪后使用同目录临时文件和 `os.replace` 更新 `current.json`。新隐藏子进程在健康窗口内退出会原子恢复 previous pointer，隐藏重启旧版并报告旧版 ready。
 
-## 发布验收与回滚
-
-验收必须同时满足：节点心跳在线、能力包含 `diarize`、ECAPA 预检通过、引擎管家
-仍为隐藏常驻、NodeJob probe 成功。任一条件不满足时，恢复发布前记录的代码和
-`CAPABILITIES`，并停止在 canary 前；不得启动白月光全量任务。
+离线检查：`python -m pytest gpunode/tests/test_release_channel.py`，随后计算 bootstrap SHA-256 并与伴随 `.sha256` 比较。测试使用注入 transport、时钟、sleep 和进程工厂，不会联网或启动真实进程。

@@ -109,6 +109,24 @@ CREATE INDEX IF NOT EXISTS idx_tasks_cache ON pipeline_tasks(input_hash)
 CREATE INDEX IF NOT EXISTS idx_tasks_ready ON pipeline_tasks(status, gpu_required)
     WHERE status = 'pending';
 
+CREATE TABLE IF NOT EXISTS gpu_nodes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    gpu_model VARCHAR(100),
+    vram_gb INTEGER,
+    capabilities JSONB NOT NULL DEFAULT '[]',
+    online BOOLEAN NOT NULL DEFAULT TRUE,
+    last_heartbeat TIMESTAMPTZ,
+    token_hash VARCHAR(64),
+    release_version VARCHAR(32),
+    release_digest VARCHAR(64),
+    release_ready BOOLEAN NOT NULL DEFAULT FALSE,
+    release_draining BOOLEAN NOT NULL DEFAULT FALSE,
+    release_reported_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_gpu_nodes_release_state
+    ON gpu_nodes(release_ready, release_draining);
+
 -- Stage 1：独立节点短作业队列（不改变 pipeline_tasks）
 CREATE TABLE IF NOT EXISTS node_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
