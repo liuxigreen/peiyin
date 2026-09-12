@@ -4,11 +4,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MANIFEST_PATH = Path(__file__).with_name("models") / "manifest.json"
+DEFAULT_MANIFEST_PATH = Path(os.getenv("NODE_MODEL_MANIFEST", Path(__file__).with_name("models") / "manifest.json"))
 ECAPA_MODEL_ID = "speechbrain/spkrec-ecapa-voxceleb"
 
 

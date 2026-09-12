@@ -14,6 +14,9 @@
 
 ## 构包、签名和发布
 
+首包固定且仅包含以下 12 个 overlay 文件：
+`gpunode/node_jobs.py`、`gpunode/legacy_artifact_backfill.py`、`gpunode/model_inventory.py`、`gpunode/stages/__init__.py`、`gpunode/stages/demo.py`、`gpunode/stages/diarize_node.py`、`gpunode/stages/engine_manager.py`、`gpunode/stages/offline.py`、`gpunode/stages/real_cpu.py`、`gpunode/stages/router.py`、`gpunode/stages/separate_node.py`、`gpunode/stages/tts_node.py`。
+
 发布者在隔离目录中只列出经审阅的 payload 文件，构包器拒绝 `entrypoint.py`、`workdir`、`models` 和名称包含 token/key/secret 的路径：
 
 ```bash
@@ -21,6 +24,8 @@ python gpunode/scripts/build_node_release.py --source-root . --output-dir out --
 ```
 
 将 zip 和 manifest 上传到 allowlist 中的 HTTPS 主机。supervisor 先验 HMAC、包 SHA-256 和逐文件 SHA-256，再安全解压到不可变的 `releases/<version>`。
+
+首次发布使用 `--first-payload` 代替 `--include`；两者不能组合。前置条件是本机既有 entrypoint、workdir、models、token 与依赖均已存在且受保护，控制面 release-state 端点已部署，minimum 版本尚未激活。overlay 不安装依赖或模型。本轮不产生真实 key 或发布包。
 
 ## 切换、回滚与离线验证
 

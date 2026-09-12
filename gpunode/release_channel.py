@@ -126,7 +126,7 @@ class ReleaseSupervisor:
     def launch(self,version):
         release=self.releases/version
         if not release.is_dir() or not self.entrypoint.is_file(): raise ReleaseError("release launch target unavailable")
-        py=Path(sys.executable).with_name("pythonw.exe") if IS_WINDOWS else Path(sys.executable); code="import runpy,sys;sys.path[:0]="+repr([str(release/"gpunode"),str(self.entrypoint.parent)])+";runpy.run_path("+repr(str(self.entrypoint))+",run_name='__main__')"; kw={"close_fds":not IS_WINDOWS}
+        py=Path(sys.executable).with_name("pythonw.exe") if IS_WINDOWS else Path(sys.executable); code="import runpy,sys;sys.path[:0]="+repr([str(release/"gpunode"),str(self.entrypoint.parent)])+";runpy.run_path("+repr(str(self.entrypoint))+",run_name='__main__')"; env=dict(os.environ);env.setdefault("NODE_WORKDIR",str(self.entrypoint.parent/"workdir"));env.setdefault("NODE_MODEL_MANIFEST",str(self.entrypoint.parent/"models"/"manifest.json")); kw={"close_fds":not IS_WINDOWS,"env":env}
         if IS_WINDOWS:
             kw["creationflags"]=getattr(subprocess,"CREATE_NO_WINDOW",0x08000000); s=subprocess.STARTUPINFO(); s.dwFlags|=subprocess.STARTF_USESHOWWINDOW; s.wShowWindow=0; kw["startupinfo"]=s
         self.child=self.popen([str(py),"-c",code],**kw); return self.child

@@ -16,7 +16,10 @@ import urllib.request
 
 import numpy as np
 
-from ..model_inventory import ecapa_preflight
+try:
+    from ..model_inventory import ecapa_preflight
+except ImportError:
+    from model_inventory import ecapa_preflight
 from .router import register
 
 WORKDIR = os.getenv("NODE_WORKDIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workdir"))
@@ -31,8 +34,7 @@ _HF_CANDIDATES = [
 ]
 
 
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "workdir", "node_token.txt")
+TOKEN_FILE = os.path.join(WORKDIR, "node_token.txt")
 
 
 def _node_token() -> str:

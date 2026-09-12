@@ -3,6 +3,8 @@
 from __future__ import annotations
 import argparse, hashlib, hmac, json, os, re, tempfile, zipfile
 from pathlib import Path, PurePosixPath
+FIRST_PAYLOAD_FILES = (
+ "gpunode/node_jobs.py","gpunode/legacy_artifact_backfill.py","gpunode/model_inventory.py","gpunode/stages/__init__.py","gpunode/stages/demo.py","gpunode/stages/diarize_node.py","gpunode/stages/engine_manager.py","gpunode/stages/offline.py","gpunode/stages/real_cpu.py","gpunode/stages/router.py","gpunode/stages/separate_node.py","gpunode/stages/tts_node.py")
 
 def _safe_name(name: str) -> PurePosixPath:
     path = PurePosixPath(name)
@@ -45,7 +47,7 @@ def build_release(source_root: Path, output_dir: Path, version: str, source_revi
                 "package_sha256": hashlib.sha256(stage_package.read_bytes()).hexdigest(), "files": files}
     manifest["signature"] = hmac.new(hmac_key, canonical(manifest), hashlib.sha256).hexdigest()
     manifest_path = output_dir / (package.stem + ".manifest.json"); stage_manifest = stage / "manifest.json"
-    stage_manifest.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    stage_manifest.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     output_dir.mkdir(parents=True, exist_ok=True); os.replace(stage_package, package); os.replace(stage_manifest, manifest_path); stage.rmdir()
     return package, manifest_path
 
@@ -53,9 +55,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--version", required=True); parser.add_argument("--source-revision", required=True); parser.add_argument("--package-url", required=True)
-    parser.add_argument("--hmac-key-file", type=Path, required=True); parser.add_argument("--include", action="append", default=[])
+    parser.add_argument("--hmac-key-file", type=Path, required=True); payload=parser.add_mutually_exclusive_group(required=True); payload.add_argument("--include", action="append"); payload.add_argument("--first-payload",action="store_true")
     args = parser.parse_args()
     package, manifest = build_release(args.source_root, args.output_dir, args.version, args.source_revision,
-                                      args.hmac_key_file.read_bytes().strip(), args.include, args.package_url)
+                                      args.hmac_key_file.read_bytes().strip(), list(FIRST_PAYLOAD_FILES) if args.first_payload else args.include, args.package_url)
     print(package); print(manifest)
 if __name__ == "__main__": main()
