@@ -23,6 +23,7 @@ WORKDIR = os.getenv("NODE_WORKDIR", os.path.join(os.path.dirname(os.path.dirname
 REF_DIR = os.path.join(WORKDIR, "zh_refs")
 CONTROL = os.getenv("CONTROL_URL", "http://localhost:8500").rstrip("/")
 MAX_ZH_AUDIO_BYTES = int(os.getenv("NODE_ZH_AUDIO_MAX_BYTES", str(2 << 30)))
+ZH_AUDIO_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("NODE_ZH_AUDIO_DOWNLOAD_TIMEOUT_SECONDS", "600"))
 
 _HF_CANDIDATES = [
     lambda: os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe"),
@@ -63,7 +64,7 @@ def _download_zh_audio(local_path: str, audio_url: str) -> str:
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=ZH_AUDIO_DOWNLOAD_TIMEOUT_SECONDS) as response:
             status = getattr(response, "status", None)
             if status is None:
                 status = response.getcode()

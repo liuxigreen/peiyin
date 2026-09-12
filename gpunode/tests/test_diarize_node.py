@@ -57,7 +57,7 @@ def test_download_uses_control_relative_url_and_bearer_token(tmp_path, monkeypat
     assert diarize._download_zh_audio(str(target), "/api/nodes/voices/zhaudio/a.mp3") == str(target)
     assert target.read_bytes() == b"zh-audio"
     assert seen == {"url": "https://control.example/api/nodes/voices/zhaudio/a.mp3",
-                    "auth": "Bearer persisted-token", "timeout": 60}
+                    "auth": "Bearer persisted-token", "timeout": diarize.ZH_AUDIO_DOWNLOAD_TIMEOUT_SECONDS}
 
 
 def test_download_rejects_missing_token_and_http_failure(tmp_path, monkeypatch):
