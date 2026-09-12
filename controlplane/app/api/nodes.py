@@ -172,6 +172,17 @@ def claim(capabilities: str = "", model: str | None = None, n: int = 1,
                 break
             task = dict(row)
             task.pop("lease_until", None); task.pop("created_at", None)
+            # 兼容常驻节点的既有分派协议：任务参数仍由 output_paths 保存，
+            # 同时投影为 input_payload，避免节点把 payload 误判为空。
+            stored_outputs = task.get("output_paths") or {}
+            if isinstance(stored_outputs, str):
+                try:
+                    stored_outputs = _json.loads(stored_outputs)
+                except _json.JSONDecodeError:
+                    stored_outputs = {}
+            payload = stored_outputs.get("payload") if isinstance(stored_outputs, dict) else None
+            if isinstance(payload, dict):
+                task["input_payload"] = payload
             tasks.append(task)
     if not tasks:
         return {"task": None, "tasks": []}   # 204语义：空轮询long-poll在C1后启用

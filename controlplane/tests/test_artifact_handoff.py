@@ -87,6 +87,7 @@ def test_complete_then_vocals_artifact_creates_authenticated_url(tmp_path, monke
     claimed = client.get("/api/nodes/me/claim", headers=diarize_headers)
     assert claimed.status_code == 200, claimed.text
     assert claimed.json()["task"]["id"] == handoff.id
+    assert claimed.json()["task"]["input_payload"]["zh_audio_url"] == url
     downloaded = client.get(url, headers={"Authorization": "Bearer diarize-node"})
     assert downloaded.status_code == 200 and downloaded.content == b"control-plane-vocals"
 
