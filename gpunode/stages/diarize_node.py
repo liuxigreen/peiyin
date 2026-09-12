@@ -136,7 +136,14 @@ def _snr(path: str) -> float:
 
 @register("diarize")
 def run_diarize(task: dict) -> list[dict]:
-    payload = task.get("payload") or {}
+    payload = task.get("payload")
+    if payload is None or payload == {}:
+        output_paths = task.get("output_paths")
+        output_payload = (
+            output_paths.get("payload")
+            if isinstance(output_paths, dict) else None
+        )
+        payload = output_payload if isinstance(output_payload, dict) else {}
     zh_audio = payload.get("zh_audio") or ""
     slots = payload.get("srt_slots") or []
     if not os.path.isfile(zh_audio):

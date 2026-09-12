@@ -97,6 +97,68 @@ def test_run_diarize_downloads_missing_payload_audio(tmp_path, monkeypatch):
                     "audio_url": "/api/nodes/voices/zhaudio/a.mp3"}
 
 
+def test_run_diarize_falls_back_to_claimed_output_payload(tmp_path, monkeypatch):
+    downloaded = tmp_path / "downloaded.mp3"
+    downloaded.write_bytes(b"audio")
+    seen = {}
+
+    def fake_download(local_path, audio_url):
+        seen.update(local_path=local_path, audio_url=audio_url)
+        return str(downloaded)
+
+    monkeypatch.setattr(diarize, "_download_zh_audio", fake_download)
+    task = {
+        "id": "diarize-1",
+        "task_type": "diarize",
+        "payload": {},
+        "output_paths": {
+            "payload": {
+                "zh_audio_url": "/api/nodes/tasks/source-1/artifacts/vocals/vocals.wav",
+                "srt_slots": [],
+            }
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="srt_slots empty"):
+        diarize.run_diarize(task)
+
+    assert seen == {
+        "local_path": "",
+        "audio_url": "/api/nodes/tasks/source-1/artifacts/vocals/vocals.wav",
+    }
+
+
+def test_run_diarize_keeps_nonempty_top_level_payload_precedence(tmp_path, monkeypatch):
+    audio = tmp_path / "local.mp3"
+    audio.write_bytes(b"audio")
+    seen = []
+
+    monkeypatch.setattr(
+        diarize,
+        "_download_zh_audio",
+        lambda *_args: pytest.fail("local top-level audio must be used"),
+    )
+    monkeypatch.setattr(
+        diarize,
+        "_cut_slots",
+        lambda path, slots: seen.append((path, slots)) or [],
+    )
+    with pytest.raises(RuntimeError, match="too few valid refs"):
+        diarize.run_diarize({
+            "payload": {
+                "zh_audio": str(audio),
+                "srt_slots": [{"uid": "u1", "start_ms": 0, "end_ms": 500}],
+            },
+            "output_paths": {
+                "payload": {
+                    "zh_audio_url": "/must-not-be-used",
+                    "srt_slots": [],
+                }
+            },
+        })
+    assert seen == [(str(audio), [{"uid": "u1", "start_ms": 0, "end_ms": 500}])]
+
+
 def _install_fake_runtime(monkeypatch, read, encode=None, init_error=None):
     """注入 soundfile/torch/ECAPA/sklearn，测试不触发真实模型、GPU 或网络。"""
     class LibsndfileError(Exception):
