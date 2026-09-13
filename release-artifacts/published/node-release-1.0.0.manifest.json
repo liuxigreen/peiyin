@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "source_revision": "863c454",
+  "package_url": "https://raw.githubusercontent.com/liuxigreen/peiyin/88d2675121c7a89903a1f329a3994cf965382d5c/release-artifacts/published/node-release-1.0.0.zip",
+  "package_sha256": "a4b7b6de71e5419a91b2f00eddcc86748e1565e1841df0e176167d0be315a1e1",
+  "files": {
+    "gpunode/legacy_artifact_backfill.py": "b67c6e4d9bf3306102baf21908301df1bf8faec97ccf3df840242a992d799273",
+    "gpunode/model_inventory.py": "4bf565706e7ea425c759ac5688e66400f64e01572c7eee8e047f4fa9880932e6",
+    "gpunode/node_jobs.py": "24947dddfc9103fd976327ccd5ffbdfa0994369901bc40a5c69ede8005df9eae",
+    "gpunode/stages/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gpunode/stages/demo.py": "2052cf63bb405bef9d1615dbeb47627f7791b883837c85950ff2f4d4278615bd",
+    "gpunode/stages/diarize_node.py": "9546927d7509fc8c6e0a9cb5b9524be74567c65993c4f5d826f5f2bb630b45c5",
+    "gpunode/stages/engine_manager.py": "86840c706132bdbb810da433b1e2df8b741cbaf973956d5ae79aa435461e200e",
+    "gpunode/stages/offline.py": "284cd0842e410c72b81afe52069d9cc9492d1590f29336492eb218c6a9af2d4b",
+    "gpunode/stages/real_cpu.py": "eb04ea785a1780e67ca797d6c84404618d9f517ba5d86219043294295388679c",
+    "gpunode/stages/router.py": "dd30b5f0f300024858488d05cc736f4603ffc1c0ead5aaf4e9f5fbaba92d1fac",
+    "gpunode/stages/separate_node.py": "891653f5a727f63596928dd8df63e930d38171532974e5bdb76e1abe2610af3b",
+    "gpunode/stages/tts_node.py": "3ed06583af3bb891cf8d70570fb693f6ecbbfd627d7dde93dce4d13c98fb5ce7"
+  },
+  "signature": "c6487b7cea1307c0c9920ec2037568c96606fb96b1195c03e02a1d455d8fa7b7"
+}
