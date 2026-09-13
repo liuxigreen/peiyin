@@ -2,15 +2,19 @@
 
 此通道一次安装稳定的 `release_channel.py` supervisor，以后从受信任的 HTTPS 发布源取得带 HMAC-SHA256 签名的 manifest。它不修改现有节点入口、模型、工作目录或令牌。
 
-## 安装（管理员在 3060 上执行）
+## 一次性安装（管理员在 3060 上执行）
 
-解压 `node-release-channel-bootstrap-v1.zip`，使用管理员提供的控制面 URL、manifest URL、允许主机列表和一次性 HMAC key 文件运行：
+解压 `node-release-channel-bootstrap-v1.zip` 后，只需提供既有控制面地址、本机既有节点入口和原来的隐藏常驻任务名：
 
 ```powershell
-.\gpunode\scripts\install_release_channel.ps1 -ControlPlaneUrl 'https://control.example' -ManifestUrl 'https://releases.example/node.manifest.json' -AllowedHost 'releases.example' -HmacKeyFile 'D:\secure\release-hmac.key' -EntryPointPath 'E:\peiyin-node\gpunode\entrypoint.py' -InstallRoot 'E:\peiyin-node\release-channel' -ResidentTaskName 'ExistingHiddenNodeTask'
+.\gpunode\scripts\install_release_channel.ps1 -ControlPlaneUrl 'https://control.example' -EntryPointPath 'E:\peiyin-node\gpunode\entrypoint.py' -InstallRoot 'E:\peiyin-node\release-channel' -ResidentTaskName 'ExistingHiddenNodeTask'
 ```
 
-密钥内容不写入配置、日志或 bootstrap；配置只保存管理员提供的受保护 key file 路径。安装器备份同一个既有隐藏 Scheduled Task 定义、停止旧实例，以 sibling staging 原子替换 supervisor 后复用原任务名；任何失败都会恢复任务定义并重启旧 resident。bootstrap 内含 `bootstrap/current.json` 与 `bootstrap/releases/0.0.0/.release-meta.json` 空 overlay，网络不可用时仍让本地既有入口运行。请在维护窗口执行；本变更没有执行真实部署、下载、计划任务或节点操作。
+不再人工传入 manifest 地址、允许主机列表或 HMAC key。supervisor 复用节点既有 Bearer token，从控制面一次性 bootstrap 接口取得受限发布地址和仅在内存使用的签名密钥；密钥不会写入配置、日志或 bootstrap。
+
+控制面只会向已明确允许的节点 ID 返回 bootstrap，接口响应禁止缓存。网络或 bootstrap 暂不可用时，supervisor 继续运行本机既有 `0.0.0` 入口并在下一轮重试，不会停止现有节点服务。
+
+安装器备份同一个既有隐藏 Scheduled Task 定义、停止旧实例，以 sibling staging 原子替换 supervisor 后复用原任务名；任何失败都会恢复任务定义并重启旧 resident。bootstrap 内含 `bootstrap/current.json` 与 `bootstrap/releases/0.0.0/.release-meta.json` 空 overlay。请在维护窗口执行；本变更没有执行真实部署、下载、计划任务或节点操作。
 
 ## 构包、签名和发布
 

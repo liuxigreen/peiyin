@@ -89,6 +89,16 @@ def test_installer_cleanup_block_is_commit_only():
  text=(Path(__file__).parents[1]/'scripts'/'install_release_channel.ps1').read_text();main,cleanup=text.split("try { if($committed",1)
  assert "$committed=$true } catch" in main and "if(-not $committed){if($activatedNew" in main and "Remove-Item -LiteralPath $InstallRoot" in main
  assert '$InstallRoot' not in cleanup.split('catch { }',1)[0] and 'schtasks' not in cleanup.lower() and 'Move-Item -LiteralPath $backup' not in cleanup
+@pytest.mark.parametrize('payload,ok', [({'schema_version':1,'manifest_url':'https://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_b64':'VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ='},True), ({'schema_version':1,'manifest_url':'http://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_b64':'VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ='},False)])
+def test_release_bootstrap_schema(payload,ok,tmp_path):
+ token=tmp_path/'token';token.write_text('resident');s=rc.StateClient('https://c',token,lambda *a:payload)
+ if ok: assert s.release_bootstrap()[0]=='https://releases.example/m'
+ else:
+  with pytest.raises(rc.ReleaseError):s.release_bootstrap()
+@pytest.mark.parametrize('mutate',[lambda p:p.update(extra=1),lambda p:p.update(manifest_url=3),lambda p:p.update(manifest_url='https://user@releases.example/m'),lambda p:p.update(manifest_url='https://releases.example/m#x'),lambda p:p.update(allowed_hosts=['RELEASES.EXAMPLE']),lambda p:p.update(allowed_hosts=['x','y']),lambda p:p.update(hmac_key_b64='***')])
+def test_release_bootstrap_malformed_is_release_error(mutate,tmp_path):
+ p={'schema_version':1,'manifest_url':'https://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_b64':'VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ='};mutate(p);token=tmp_path/'t';token.write_text('resident');s=rc.StateClient('https://c',token,lambda *a:p)
+ with pytest.raises(rc.ReleaseError):s.release_bootstrap()
 def test_real_supervisor_main_watch_restarts_only_dead_child(tmp_path):
  key=tmp_path/'key';key.write_text('x');entry=tmp_path/'entry';entry.write_text('pass');root=tmp_path/'root';(root/'releases'/'0.0.0').mkdir(parents=True);(root/'current.json').write_text(json.dumps({'current':{'version':'0.0.0','digest':'0'*64},'previous':None}));token=tmp_path/'token';token.write_text('x');events=[];procs=[]
  s=rc.ReleaseSupervisor(root,entry,rc.StateClient('https://c',token,lambda *a:{},clock=lambda:0,sleeper=lambda x:None),popen=lambda *a,**k:procs.append(P()) or procs[-1])
@@ -118,3 +128,22 @@ def test_real_update_state_failure_waits_candidate_before_old_relaunch(tmp_path)
  x=X();s=rc.ReleaseSupervisor(root,entry,rc.StateClient('https://c',token,x,clock=lambda:0,sleeper=lambda x:None),popen=lambda *a,**k:calls.append(P() if calls else Candidate()) or calls[-1],clock=lambda:0,sleeper=lambda x:None);s.write_pointer({'version':'1.0.0','digest':'a'*64},None);s.child=P(True);p,m=pkg()
  with pytest.raises(rc.ReleaseError):s.update(m,p,KEY,HOSTS,health_seconds=0)
  assert len(calls)==2 and rc.pointer(s.path)['current']['version']=='1.0.0' and x.posts[-1]['version']=='1.0.0' and x.posts[-1]['ready']
+
+
+def test_main_bootstrap_retries_without_stopping_current_child(tmp_path):
+    entry=tmp_path/'entry';entry.write_text('pass');token=tmp_path/'token';token.write_text('resident')
+    root=tmp_path/'root';(root/'releases'/'0.0.0').mkdir(parents=True);(root/'current.json').write_text(json.dumps({'current':{'version':'0.0.0','digest':'0'*64},'previous':None}))
+    bootstrap={'schema_version':1,'manifest_url':'https://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_b64':'VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ='}
+    child=[]; state=rc.StateClient('https://control',token,lambda *a:bootstrap)
+    s=rc.ReleaseSupervisor(root,entry,state,popen=lambda *a,**k:child.append(P()) or child[-1])
+    attempts=[]
+    def update(url,key,hosts):
+        attempts.append((url,key,hosts))
+        if len(attempts)==2: raise rc.ReleaseError('temporary')
+    s.update_from_manifest_url=update
+    cfg=tmp_path/'config.json';cfg.write_text(json.dumps({'control_plane_url':'https://control','entrypoint_path':str(entry),'poll_seconds':1}))
+    class Stop(BaseException): pass
+    def sleep(_):
+        if len(attempts)>=3: raise Stop()
+    with pytest.raises(Stop): rc.main(['--config',str(cfg),'--watch'],supervisor_factory=lambda:s,sleeper=sleep)
+    assert len(child)==1 and child[0].poll() is None and len(attempts)==3

@@ -2,9 +2,11 @@
 register / claim(原子领取) / heartbeat / complete / fail / 节点列表
 生产Postgres走 SKIP LOCKED（app/core/queue.py），sqlite退化用事务内
 status条件更新实现同语义——两方言均保证不重复派发。"""
-import hashlib, json as _json, os, re as _re, secrets
+import base64, binascii, hashlib, json as _json, os, re as _re, secrets
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from urllib.parse import urlsplit
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import text as satext
 from sqlalchemy.orm import Session
 from ..db.session import get_db
@@ -57,6 +59,61 @@ def _auth_node(db: Session, authorization: str) -> m.GpuNode:
     elif not node.online:
         node.online = True; db.commit()
     return node
+
+
+def _release_bootstrap_config() -> tuple[str, str, set[str], str] | None:
+    """Read and validate the node-local release bootstrap configuration.
+
+    The decoded HMAC key intentionally never leaves this helper.  Comparing the
+    input with its standard encoding rejects whitespace, URL-safe alphabets, and
+    non-canonical base64 spellings before the configured value is returned.
+    """
+    node_ids_raw = os.getenv("NODE_RELEASE_BOOTSTRAP_NODE_IDS", "")
+    node_ids = [node_id.strip() for node_id in node_ids_raw.split(",")]
+    if not node_ids_raw.strip() or any(not node_id for node_id in node_ids):
+        return None
+
+    manifest_url = os.getenv("NODE_RELEASE_MANIFEST_URL", "")
+    try:
+        parsed = urlsplit(manifest_url)
+        hostname = parsed.hostname
+    except (TypeError, ValueError):
+        return None
+    if (parsed.scheme != "https" or not hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.fragment or "#" in manifest_url):
+        return None
+
+    hmac_key_b64 = os.getenv("NODE_RELEASE_HMAC_KEY_B64", "")
+    try:
+        decoded_key = base64.b64decode(hmac_key_b64, validate=True)
+    except (ValueError, UnicodeEncodeError, binascii.Error):
+        return None
+    if not 32 <= len(decoded_key) <= 64:
+        return None
+    if base64.b64encode(decoded_key).decode("ascii") != hmac_key_b64:
+        return None
+    return manifest_url, hostname.lower(), set(node_ids), hmac_key_b64
+
+
+@router.get("/me/release-bootstrap")
+def release_bootstrap(response: Response, authorization: str = Header(default=""),
+                      db: Session = Depends(get_db)):
+    """Return the deployment manifest and HMAC material to an approved node."""
+    node = _auth_node(db, authorization)
+    config = _release_bootstrap_config()
+    if config is None:
+        raise HTTPException(503, "release bootstrap unavailable")
+    manifest_url, hostname, allowed_node_ids, hmac_key_b64 = config
+    if node.id not in allowed_node_ids:
+        raise HTTPException(403, "forbidden")
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "schema_version": 1,
+        "manifest_url": manifest_url,
+        "allowed_hosts": [hostname],
+        "hmac_key_b64": hmac_key_b64,
+    }
 
 
 def _release_payload(node: m.GpuNode) -> dict:

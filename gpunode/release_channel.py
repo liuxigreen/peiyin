@@ -1,6 +1,6 @@
 """Stable stdlib-only release supervisor; importing it has no side effects."""
 from __future__ import annotations
-import hashlib,hmac,io,json,os,re,shutil,stat,subprocess,sys,tempfile,time,urllib.parse,urllib.request,uuid,zipfile
+import base64,hashlib,hmac,io,json,os,re,shutil,stat,subprocess,sys,tempfile,time,urllib.parse,urllib.request,uuid,zipfile
 from pathlib import Path,PurePosixPath
 
 VERSION=re.compile(r"^\d+\.\d+\.\d+(?:\.\d+)?$"); SHA=re.compile(r"^[0-9a-f]{64}$")
@@ -101,6 +101,20 @@ class StateClient:
             if r.get("ready_to_switch") and not r.get("running_pipeline_tasks",0) and not r.get("running_node_jobs",0): return True
             if self.clock()>=end: return False
             self.sleeper(2)
+    def release_bootstrap(self):
+        data=self.request("GET","/api/nodes/me/release-bootstrap")
+        if not isinstance(data,dict) or set(data)!={"schema_version","manifest_url","allowed_hosts","hmac_key_b64"} or data["schema_version"]!=1: raise ReleaseError("invalid bootstrap")
+        url=data["manifest_url"]
+        if not isinstance(url,str): raise ReleaseError("invalid bootstrap")
+        parsed=urllib.parse.urlsplit(url); host=parsed.hostname
+        if parsed.scheme!="https" or parsed.username or parsed.password or parsed.fragment or not isinstance(host,str) or host.lower()!=host: raise ReleaseError("invalid bootstrap")
+        if not isinstance(data["allowed_hosts"],list) or len(data["allowed_hosts"])!=1 or not isinstance(data["allowed_hosts"][0],str) or data["allowed_hosts"][0]!=host or data["allowed_hosts"][0].lower()!=data["allowed_hosts"][0]: raise ReleaseError("invalid bootstrap")
+        validate_url(url,{host})
+        if not isinstance(data["hmac_key_b64"],str): raise ReleaseError("invalid bootstrap")
+        try:key=base64.b64decode(data["hmac_key_b64"],validate=True)
+        except Exception:raise ReleaseError("invalid bootstrap") from None
+        if not 32<=len(key)<=64:raise ReleaseError("invalid bootstrap")
+        return url,{host},key
 def pointer(path):
     try: p=json.loads(path.read_text())
     except FileNotFoundError: return {"current":None,"previous":None}
@@ -175,22 +189,23 @@ class ReleaseSupervisor:
     def update_from_manifest_url(self,url,key,hosts,opener=None):
         m=download_manifest(url,hosts,opener); validate_manifest(m,key,hosts); return self.update(m,download_limited(m["package_url"],hosts,opener),key,hosts)
 def _config(path):
-    c=json.loads(Path(path).read_text(encoding="utf-8")); hosts={str(x).lower() for x in c.get("allowed_hosts",[])}
-    if not hosts or not c.get("hmac_key_file") or not c.get("entrypoint_path") or int(c.get("poll_seconds",900))<1: raise ReleaseError("invalid release configuration")
+    c=json.loads(Path(path).read_text(encoding="utf-8"))
+    if not c.get("entrypoint_path") or int(c.get("poll_seconds",900))<1: raise ReleaseError("invalid release configuration")
     if urllib.parse.urlsplit(c.get("control_plane_url","")).scheme!="https": raise ReleaseError("invalid release configuration")
-    validate_url(c.get("manifest_url",""),hosts)
-    return c,hosts
+    return c
 def main(argv=None, supervisor_factory=None, update=None, sleeper=time.sleep):
     import argparse
     p=argparse.ArgumentParser();p.add_argument("--config",required=True);p.add_argument("--watch",action="store_true");a=p.parse_args(argv)
     try:
-        c,hosts=_config(a.config); entry=Path(c["entrypoint_path"]); key=Path(c["hmac_key_file"]).read_bytes().strip()
-        if not key: raise ReleaseError("invalid release configuration")
+        c=_config(a.config); entry=Path(c["entrypoint_path"])
         sf=supervisor_factory or (lambda: ReleaseSupervisor(Path(a.config).parent,entry,StateClient(c["control_plane_url"],Path(c.get("token_file",entry.parent/"workdir"/"node_token.txt")),urllib_transport)))
         s=sf()
         while True:
             s.ensure_current_running()
-            try: (update or (lambda:s.update_from_manifest_url(c["manifest_url"],key,hosts)))()
+            try:
+                if update:update()
+                else:
+                    url,hosts,key=s.state.release_bootstrap();s.update_from_manifest_url(url,key,hosts)
             except ReleaseError: pass
             if not a.watch:return 0
             sleeper(int(c.get("poll_seconds",900)))
