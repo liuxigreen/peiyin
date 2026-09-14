@@ -71,7 +71,7 @@ export default function Projects() {
 
     {!err && shown.length === 0 && (
       <div className="empty-state">
-        <div className="empty-icon">🎬</div>
+        <div className="empty-icon"><IcFilm /></div>
         <p>{q ? '没有匹配的项目' : '还没有项目——上传第一部分字幕，开始译配'}</p>
         <Link to="/projects/new" className="btn">创建第一个项目</Link>
       </div>

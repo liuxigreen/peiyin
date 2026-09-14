@@ -11,22 +11,22 @@ type NodeDef = {
 // 节点状态：done=已实现已测 ✅  partial=骨架/离线版 🔶  todo=待GPU/外部接入 ⬜
 const NODES: NodeDef[] = [
   // 第一行：入口与控制面
-  { id: 'web', title: '🌐 Web面板', desc: '项目/对照表/Providers/资产 · 深色工作台UI', status: 'done', badge: '已实现', col: 1, row: 1 },
-  { id: 'api', title: '🚪 API网关', desc: 'FastAPI :8500 · 30+端点 · 上传签名/翻译/节点协议', status: 'done', badge: '已实现', col: 2, row: 1 },
-  { id: 'orch', title: '🎬 调度Agent', desc: '任务DAG扫描 · 依赖解锁 · 缓存命中跳过', status: 'done', badge: '已实现', col: 3, row: 1 },
-  { id: 'reaper', title: '🗡 Reaper', desc: 'lease超时收割 · 节点死亡自动回队重派', status: 'done', badge: '已实现', col: 4, row: 1 },
-  { id: 'power', title: '💰 算力Agent', desc: 'GPU队列水位 → 自动开关机 · 日预算安全阀（干跑）', status: 'partial', badge: '离线版', col: 5, row: 1 },
+  { id: 'web', title: ' Web面板', desc: '项目/对照表/Providers/资产 · 深色工作台UI', status: 'done', badge: '已实现', col: 1, row: 1 },
+  { id: 'api', title: ' API网关', desc: 'FastAPI :8500 · 30+端点 · 上传签名/翻译/节点协议', status: 'done', badge: '已实现', col: 2, row: 1 },
+  { id: 'orch', title: ' 调度Agent', desc: '任务DAG扫描 · 依赖解锁 · 缓存命中跳过', status: 'done', badge: '已实现', col: 3, row: 1 },
+  { id: 'reaper', title: ' Reaper', desc: 'lease超时收割 · 节点死亡自动回队重派', status: 'done', badge: '已实现', col: 4, row: 1 },
+  { id: 'power', title: ' 算力Agent', desc: 'GPU队列水位 → 自动开关机 · 日预算安全阀（干跑）', status: 'partial', badge: '离线版', col: 5, row: 1 },
   // 第二行：任务队列 + 三类算力
-  { id: 'db', title: '🗄 任务队列', desc: 'SQLite→PG 双方言 · pipeline_tasks 唯一真理之源', status: 'done', badge: '已实现', col: 2.5, row: 2 },
-  { id: 'cpu', title: '💻 CPU池', desc: '翻译五步链 · 字幕生成 · 混音 · QC · 交付打包', status: 'done', badge: '已实现', col: 4, row: 2 },
-  { id: 'gpu', title: '🎮 GPU节点池', desc: '3060已接入(CosyVoice3+Demucs) · 4090按需租 · 心跳摘除', status: 'done', badge: '已接入', col: 4.6, row: 2.55 },
-  { id: 'io', title: '☁️ 外部API池', desc: '翻译LLM(网页填key) · Confucius4-TTS多语种', status: 'partial', badge: '可扩展', col: 3.4, row: 2.55 },
+  { id: 'db', title: ' 任务队列', desc: 'SQLite→PG 双方言 · pipeline_tasks 唯一真理之源', status: 'done', badge: '已实现', col: 2.5, row: 2 },
+  { id: 'cpu', title: ' CPU池', desc: '翻译五步链 · 字幕生成 · 混音 · QC · 交付打包', status: 'done', badge: '已实现', col: 4, row: 2 },
+  { id: 'gpu', title: ' GPU节点池', desc: '3060已接入(CosyVoice3+Demucs) · 4090按需租 · 心跳摘除', status: 'done', badge: '已接入', col: 4.6, row: 2.55 },
+  { id: 'io', title: ' 外部API池', desc: '翻译LLM(网页填key) · Confucius4-TTS多语种', status: 'partial', badge: '可扩展', col: 3.4, row: 2.55 },
   // 第三行：处理阶段
-  { id: 'upload', title: '⬆️ 上传·种子', desc: 'SRT→台词→自动起流程（upload-complete一键）', status: 'done', badge: '已实现', col: 1, row: 3 },
-  { id: 'recognize', title: '🔍 识别·对齐', desc: 'diarize声纹聚类 / FunASR / OCR → 台词库', status: 'todo', badge: '待实装', col: 2, row: 3 },
-  { id: 'translate', title: '🗣 翻译五步链', desc: '句特征路由→直译→意译→终检→音节校验', status: 'done', badge: '已实现', col: 3, row: 3 },
-  { id: 'tts', title: '🎙 TTS配音', desc: '3060 CosyVoice3 实测中 · 按语种路由 · 产物回传', status: 'done', badge: '实测通过', col: 4, row: 3 },
-  { id: 'render', title: '🎞 渲染·交付', desc: '擦字幕 · fit时长 · 混音 · ASS烧录 · 交付包', status: 'done', badge: '已实现', col: 5, row: 3 },
+  { id: 'upload', title: ' 上传·种子', desc: 'SRT→台词→自动起流程（upload-complete一键）', status: 'done', badge: '已实现', col: 1, row: 3 },
+  { id: 'recognize', title: ' 识别·对齐', desc: 'diarize声纹聚类 / FunASR / OCR → 台词库', status: 'todo', badge: '待实装', col: 2, row: 3 },
+  { id: 'translate', title: ' 翻译五步链', desc: '句特征路由→直译→意译→终检→音节校验', status: 'done', badge: '已实现', col: 3, row: 3 },
+  { id: 'tts', title: ' TTS配音', desc: '3060 CosyVoice3 实测中 · 按语种路由 · 产物回传', status: 'done', badge: '实测通过', col: 4, row: 3 },
+  { id: 'render', title: ' 渲染·交付', desc: '擦字幕 · fit时长 · 混音 · ASS烧录 · 交付包', status: 'done', badge: '已实现', col: 5, row: 3 },
 ]
 
 const STATUS_STYLE: Record<NodeDef['status'], { border: string; badge: string }> = {

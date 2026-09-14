@@ -25,16 +25,13 @@ function Ring({ pct }: { pct: number }) {
   const R = 30, C = 2 * Math.PI * R
   return (
     <svg width="76" height="76" viewBox="0 0 76 76" style={{ flex: 'none' }}>
-      <defs><linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stopColor="#6e7bff" /><stop offset="100%" stopColor="#9c6eff" />
-      </linearGradient></defs>
-      <circle cx="38" cy="38" r={R} stroke="rgba(148,163,198,.15)" strokeWidth="7" fill="none" />
-      <circle cx="38" cy="38" r={R} stroke="url(#ring)" strokeWidth="7" fill="none"
+      <circle cx="38" cy="38" r={R} stroke="rgba(255,255,255,.08)" strokeWidth="6" fill="none" />
+      <circle cx="38" cy="38" r={R} stroke="var(--accent)" strokeWidth="6" fill="none"
               strokeDasharray={C} strokeDashoffset={C * (1 - pct / 100)}
               strokeLinecap="round" transform="rotate(-90 38 38)"
               style={{ transition: 'stroke-dashoffset .5s ease' }} />
-      <text x="38" y="43" textAnchor="middle" fill="#e9edf6"
-            style={{ font: '700 16px ui-monospace,monospace' }}>{pct}%</text>
+      <text x="38" y="43" textAnchor="middle" fill="var(--text)"
+            style={{ font: '500 15px ui-monospace,monospace' }}>{pct}%</text>
     </svg>
   )
 }
