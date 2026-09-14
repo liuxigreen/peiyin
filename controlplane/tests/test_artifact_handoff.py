@@ -1,5 +1,6 @@
 """分离产物到 diarize 的控制面交接与节点下载授权。"""
 import importlib
+import hashlib
 
 from fastapi.testclient import TestClient
 
@@ -22,12 +23,17 @@ def _separate_task(client, SessionLocal):
     assert project.status_code == 200, project.text
     pid = project.json()["id"]
     from app.db.models import PipelineTask
+    producer = "producer"
+    assert client.post("/api/nodes/heartbeat", headers={"Authorization": f"Bearer {producer}"}).status_code == 200
     db = SessionLocal()
     try:
+        from app.db.models import GpuNode
+        producer_id = db.query(GpuNode).filter_by(
+            token_hash=hashlib.sha256(producer.encode()).hexdigest()).one().id
         task = PipelineTask(
             project_id=pid, task_key=f"SEPARATE/{pid[:8]}",
             task_type="separate-vocals", resource="gpu", gpu_required=True,
-            input_hash="source-hash", status="running",
+            input_hash="source-hash", status="running", claimed_by=producer_id,
             output_paths={"payload": {"source": "keep-me"}},
         )
         db.add(task)

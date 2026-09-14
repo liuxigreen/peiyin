@@ -269,7 +269,18 @@ def test_owner_heartbeat_complete_and_fail_and_limits(app_client):
     assert rejected_error.status_code == 422
 
 
-def test_reaper_retries_to_dead_and_preserves_checkpoint(app_client):
+@pytest.mark.parametrize(
+    ("max_retries", "expected_states"),
+    [
+        (0, [("dead", 0)]),
+        (1, [("pending", 1), ("dead", 1)]),
+        (2, [("pending", 1), ("pending", 2), ("dead", 2)]),
+    ],
+    ids=["zero", "one", "two"],
+)
+def test_reaper_retry_budget_and_preserves_checkpoint(
+    app_client, max_retries, expected_states
+):
     client, SessionLocal = app_client
     token = _register(client, "reaper-node")
     headers = {"Authorization": f"Bearer {token}"}
@@ -277,7 +288,7 @@ def test_reaper_retries_to_dead_and_preserves_checkpoint(app_client):
         client,
         target="reaper-node",
         checkpoint={"offset": 7, "opaque": ["keep", 1]},
-        max_retries=2,
+        max_retries=max_retries,
     )
     job_id = created["id"]
     assert client.post("/api/nodes/jobs/claim", headers=headers).json()["job"]["id"] == job_id
@@ -288,25 +299,20 @@ def test_reaper_retries_to_dead_and_preserves_checkpoint(app_client):
     db = SessionLocal()
     try:
         job = db.get(NodeJob, job_id)
-        job.lease_until = datetime.now(timezone.utc) - timedelta(minutes=1)
-        db.commit()
-        reclaimed = reap_expired(db, datetime.now(timezone.utc))
-        assert job_id in reclaimed
-        db.refresh(job)
-        assert job.status == "pending" and job.retry_count == 1
-        assert job.claimed_by is None and job.lease_until is None
-        assert job.checkpoint == {"offset": 7, "opaque": ["keep", 1]}
+        for step, (expected_status, expected_retry) in enumerate(expected_states):
+            now = datetime.now(timezone.utc)
+            job.status = "running"
+            job.claimed_by = f"old-owner-{step}"
+            job.lease_until = now - timedelta(minutes=1)
+            db.commit()
 
-        job.status = "running"
-        job.claimed_by = "old-owner"
-        job.lease_until = datetime.now(timezone.utc) - timedelta(minutes=1)
-        db.commit()
-        reap_expired(db, datetime.now(timezone.utc))
-        db.refresh(job)
-        assert job.status == "dead" and job.retry_count == 2
-        assert job.claimed_by is None and job.lease_until is None
-        assert job.checkpoint == {"offset": 7, "opaque": ["keep", 1]}
-        assert job.completed_at is None
-        assert len(job.error or "") <= 500
+            reclaimed = reap_expired(db, now)
+            db.refresh(job)
+            assert job_id in reclaimed
+            assert (job.status, job.retry_count) == (expected_status, expected_retry)
+            assert job.claimed_by is None and job.lease_until is None
+            assert job.checkpoint == {"offset": 7, "opaque": ["keep", 1]}
+            assert job.completed_at is None
+            assert len(job.error or "") <= 500
     finally:
         db.close()

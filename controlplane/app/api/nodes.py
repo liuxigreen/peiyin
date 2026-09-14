@@ -340,11 +340,20 @@ def complete(task_id: str, body: dict, authorization: str = Header(default=""),
     node = _auth_node(db, authorization)
     t = db.get(m.PipelineTask, task_id)
     if not t: raise HTTPException(404)
-    # D2修复：归属校验——任务已被reaper重派给别的节点时，旧节点的回报作废
-    # （防双写竞态：lease过期重派后原节点跑完又标completed）
-    if t.claimed_by and t.claimed_by != node.id:
+    # 完成只能由当前租约所有者提交。未领取任务同样不能被任意节点完成，
+    # 否则 pending/requeue 任务会绕开 claim 的原子领取边界。
+    if t.claimed_by != node.id:
         raise HTTPException(409, "task was reassigned; stale result discarded")
-    t.status = "completed"
+    if t.status == "completed":
+        # 同一节点的网络重发必须是纯读取：不能覆盖 outputs、再次 QC，或再建 handoff。
+        existing_qc = t.output_paths.get("qc") if isinstance(t.output_paths, dict) else None
+        return {
+            "ok": True,
+            "qc_pass": existing_qc.get("pass", True) if isinstance(existing_qc, dict) else True,
+            "qc_action": existing_qc.get("action", "none") if isinstance(existing_qc, dict) else "none",
+        }
+    if t.status != "running":
+        raise HTTPException(409, f"task is {t.status}, not running")
     # G6配套：outputs写入+payload保留。历史两处数据丢失：
     # ①节点dispatch发的是列表，整行赋值后qc钩子判定非dict→output_paths只剩{"qc"}；
     # ②即便dict也被整行覆盖，artifact回传时payload里的uid/engine已丢失。
@@ -352,17 +361,32 @@ def complete(task_id: str, body: dict, authorization: str = Header(default=""),
     # 上传可能早于 complete：在已有控制面产物之上合并节点回报，不能把
     # payload/artifacts 整行覆盖掉。列表保持既有的 outputs 兼容结构；字典
     # 仍按历史语义展开到 output_paths 顶层。
-    outs = dict(t.output_paths or {})
+    outs = dict(t.output_paths) if isinstance(t.output_paths, dict) else {}
     if isinstance(body_out, list):
         outs["outputs"] = body_out
     elif isinstance(body_out, dict):
         for name, value in body_out.items():
             if name not in ("payload", "artifacts"):
                 outs[name] = value
-    t.output_paths = outs
-    t.output_hash = body.get("output_hash")
-    t.lease_until = None
+    # Re-check owner and state at the write itself.  A reaper may reassign the
+    # task after the read above; a zero rowcount means this node must not run QC
+    # or create a dependent handoff.
+    transitioned = (db.query(m.PipelineTask)
+                    .filter(m.PipelineTask.id == task_id,
+                            m.PipelineTask.claimed_by == node.id,
+                            m.PipelineTask.status == "running")
+                    .update({
+                        m.PipelineTask.status: "completed",
+                        m.PipelineTask.output_paths: outs,
+                        m.PipelineTask.output_hash: body.get("output_hash"),
+                        m.PipelineTask.lease_until: None,
+                    }, synchronize_session=False))
+    if transitioned != 1:
+        db.rollback()
+        raise HTTPException(409, "task ownership or state changed before completion")
     db.commit()
+    db.expire_all()
+    t = db.get(m.PipelineTask, task_id)
     from ..qc_agent import run_qc_hook
     qc = run_qc_hook(t, db)          # 节点完成路径同样过QC Agent
     _queue_diarize_handoff(db, t)
@@ -529,8 +553,10 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
     t = db.get(m.PipelineTask, task_id)
     if not t:
         raise HTTPException(404)
-    if t.claimed_by and t.claimed_by != node.id:
+    if t.claimed_by != node.id:
         raise HTTPException(409, "task not claimed by this node")
+    if t.status not in ("running", "completed"):
+        raise HTTPException(409, f"task is {t.status}, not accepting artifacts")
     fname = filename or f"{t.task_key}.bin"
     artifact_key = key or fname
     if (not _TASK_ID_RE.fullmatch(task_id) or not _safe_artifact_token(fname)
@@ -540,21 +566,48 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
     dest_dir = os.path.join(storage, "artifacts", task_id)
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, fname)
+    # 每个请求都在目标文件所在目录写一个唯一临时文件；只有完整收流和大小
+    # 校验通过后才替换目标。因此失败请求不会破坏已有文件或其 DB metadata。
+    temporary = os.path.join(dest_dir, f".{fname}.{secrets.token_hex(16)}.upload")
     size = 0
-    with open(dest, "wb") as f:
-        async for chunk in request.stream():
-            size += len(chunk)
-            if size > _ART_MAX_MB << 20:
-                f.close()
-                os.remove(dest)
-                raise HTTPException(413, f"artifact exceeds {_ART_MAX_MB}MB")
-            f.write(chunk)
+    try:
+        with open(temporary, "xb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > _ART_MAX_MB << 20:
+                    raise HTTPException(413, f"artifact exceeds {_ART_MAX_MB}MB")
+                f.write(chunk)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise
+    # Claim/state are checked a second time after receiving the stream.  The
+    # conditional UPDATE acquires the target write lock before the replacement,
+    # so a reaper cannot reassign it between this check and metadata commit.
+    db.expire_all()
+    current = db.get(m.PipelineTask, task_id)
+    if current is None or current.claimed_by != node.id or current.status not in ("running", "completed"):
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise HTTPException(409, "task ownership or state changed during artifact upload")
     entry = {"key": artifact_key, "filename": fname, "path": dest, "bytes": size}
-    outs = dict(t.output_paths or {})
+    outs = dict(current.output_paths) if isinstance(current.output_paths, dict) else {}
     arts = [a for a in (outs.get("artifacts") or []) if a.get("key") != entry["key"]]
     arts.append(entry)
     outs["artifacts"] = arts          # JSON列整体重赋值（原地改不落库，HANDOVER坑#4）
-    t.output_paths = outs
+    metadata_updated = (db.query(m.PipelineTask)
+                        .filter(m.PipelineTask.id == task_id,
+                                m.PipelineTask.claimed_by == node.id,
+                                m.PipelineTask.status.in_(("running", "completed")))
+                        .update({m.PipelineTask.output_paths: outs}, synchronize_session=False))
+    if metadata_updated != 1:
+        db.rollback()
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise HTTPException(409, "task ownership or state changed during artifact upload")
+    os.replace(temporary, dest)
+    db.expire_all()
+    t = db.get(m.PipelineTask, task_id)
     clip_info = _upsert_tts_clip(db, t, dest)
     _queue_diarize_handoff(db, t)
     db.commit()
@@ -647,7 +700,9 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
     dest_dir = os.path.join(storage, "artifacts", task_id)
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, filename)
-    temporary = dest + ".backfill"
+    # 固定 .backfill 会让并发请求互相截断/删除临时文件。临时文件必须同目录
+    # 且每请求唯一，才能让 os.replace 保持替换边界。
+    temporary = os.path.join(dest_dir, f".{filename}.{secrets.token_hex(16)}.backfill")
     size = 0
     try:
         with open(temporary, "wb") as f:
@@ -657,7 +712,7 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
                     raise HTTPException(413, f"artifact exceeds {_ART_MAX_MB}MB")
                 f.write(chunk)
         os.replace(temporary, dest)
-    except Exception:
+    except BaseException:
         if os.path.exists(temporary):
             os.remove(temporary)
         if grant is not None:
@@ -785,16 +840,37 @@ def fail(task_id: str, body: dict, authorization: str = Header(default=""),
     node = _auth_node(db, authorization)
     t = db.get(m.PipelineTask, task_id)
     if not t: raise HTTPException(404)
-    if t.claimed_by and t.claimed_by != node.id:
+    if t.claimed_by != node.id:
         raise HTTPException(409, "task was reassigned; stale fail discarded")
-    t.error_message = str(body.get("error", ""))[:500]
-    retryable = bool(body.get("retryable", True))
+    if t.status != "running":
+        raise HTTPException(409, f"task is {t.status}, not running")
+    if "retryable" in body and not isinstance(body["retryable"], bool):
+        raise HTTPException(422, "retryable must be a boolean")
+    retryable = body.get("retryable", True)
     if retryable and t.retry_count < t.max_retries:
-        t.retry_count += 1
-        t.status = "pending"; t.claimed_by = None   # 回队列
+        changes = {
+            m.PipelineTask.error_message: str(body.get("error", ""))[:500],
+            m.PipelineTask.retry_count: t.retry_count + 1,
+            m.PipelineTask.status: "pending",
+            m.PipelineTask.claimed_by: None,
+        }
+        will_retry = True
     else:
-        t.status = "dead"
-    db.commit(); return {"ok": True, "will_retry": t.status == "pending"}
+        changes = {
+            m.PipelineTask.error_message: str(body.get("error", ""))[:500],
+            m.PipelineTask.status: "dead",
+        }
+        will_retry = False
+    transitioned = (db.query(m.PipelineTask)
+                    .filter(m.PipelineTask.id == task_id,
+                            m.PipelineTask.claimed_by == node.id,
+                            m.PipelineTask.status == "running")
+                    .update(changes, synchronize_session=False))
+    if transitioned != 1:
+        db.rollback()
+        raise HTTPException(409, "task ownership or state changed before failure")
+    db.commit()
+    return {"ok": True, "will_retry": will_retry}
 
 @router.get("")
 def list_nodes(db: Session = Depends(get_db)):

@@ -46,6 +46,14 @@ def _seed_translated(c, name: str, srt: str = _SRT, scene_size: int = 2):
     return pid
 
 
+def _claim_tts(c, headers, task_id):
+    assert c.post("/api/nodes/heartbeat", headers=headers,
+                  json={"capabilities": ["tts"]}).status_code == 200
+    claimed = c.get("/api/nodes/me/claim", headers=headers)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["task"]["id"] == task_id
+
+
 # ── G2：跨场景上下文取最新版本 ──────────────────────────────
 def test_prev_scene_ctx_uses_latest_version(tmp_path):
     c = _client(str(tmp_path / "g2.db"))
@@ -153,6 +161,7 @@ def test_artifact_upload_and_tts_clip(tmp_path):
     assert r["ok"], r
     tid = r["task_id"]
     H = {"Authorization": "Bearer dev-node-token"}
+    _claim_tts(c, H, tid)
     r = c.post(f"/api/nodes/tasks/{tid}/complete", headers=H,
                json={"outputs": [{"key": "tts", "path": "/node/out/tts_x.wav"}]})
     assert r.status_code == 200, r.text
@@ -380,6 +389,7 @@ def test_tts_requeue_missing_artifacts(tmp_path):
                json={"engine": "mock"}).json()
     tid = r["task_id"]
     H = {"Authorization": "Bearer dev-node-token"}
+    _claim_tts(c, H, tid)
     assert c.post(f"/api/nodes/tasks/{tid}/complete", headers=H,
                   json={"outputs": [{"key": "tts", "path": "/node/a.wav"}]}).status_code == 200
     # 完成但无artifact → requeue打回pending
@@ -392,6 +402,9 @@ def test_tts_requeue_missing_artifacts(tmp_path):
         assert db.get(PipelineTask, tid).status == "pending"
     finally:
         db.close()
+    assert c.post(f"/api/nodes/tasks/{tid}/artifact", headers=H,
+                  params={"filename": "a.wav"}, content=b"before-claim").status_code == 409
+    _claim_tts(c, H, tid)
     # 已有artifacts的任务 → requeue跳过
     import soundfile as sf
     import numpy as np
@@ -410,6 +423,7 @@ def test_tts_requeue_skips_dead_by_default(tmp_path):
     H = {"Authorization": "Bearer dev-node-token"}
     r = c.post(f"/api/projects/{pid}/mode-b/tts-task", json={"engine": "mock"}).json()
     tid = r["task_id"]
+    _claim_tts(c, H, tid)
     assert c.post(f"/api/nodes/tasks/{tid}/complete", headers=H,
                   json={"outputs": [{"key": "tts", "path": "/node/b.wav"}]}).status_code == 200
     from app.db.models import PipelineTask

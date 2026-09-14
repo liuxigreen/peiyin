@@ -30,9 +30,10 @@ def _reap_node_jobs(db, now: datetime) -> list[str]:
                  .all())
     reclaimed: list[str] = []
     for job_id, retry_count, max_retries, error in expired:
-        next_retry = (retry_count or 0) + 1
+        current_retry = retry_count or 0
         retry_limit = max_retries if max_retries is not None else 3
-        terminal = next_retry >= retry_limit
+        terminal = current_retry >= retry_limit
+        next_retry = current_retry if terminal else current_retry + 1
         status = "dead" if terminal else "pending"
         suffix = (" [lease expired beyond max retries]"
                   if terminal else " [lease expired, reclaimed]")
@@ -77,13 +78,16 @@ def reap_expired(db, now: datetime | None = None) -> list[str]:
     for t in expired:
         t.claimed_by = None
         t.lease_until = None
-        t.retry_count = (t.retry_count or 0) + 1
-        if t.retry_count >= (t.max_retries or 3):
+        current_retry = t.retry_count or 0
+        retry_limit = t.max_retries if t.max_retries is not None else 3
+        if current_retry >= retry_limit:
             t.status = "dead"
+            t.retry_count = current_retry
             t.error_message = ((t.error_message or "") +
                                " [lease expired beyond max retries]")[:500]
         else:
             t.status = "pending"
+            t.retry_count = current_retry + 1
             t.error_message = ((t.error_message or "") +
                                " [lease expired, reclaimed]")[:500]
         reclaimed.append(t.task_key)
@@ -94,23 +98,33 @@ def reap_expired(db, now: datetime | None = None) -> list[str]:
     return reclaimed + node_reclaimed
 
 
+def _run_reaper_iteration(session_factory, logger) -> None:
+    """执行一次回收并吞掉异常，保证后台循环可继续。"""
+    db = None
+    try:
+        db = session_factory()
+        keys = reap_expired(db)
+        if keys:
+            logger.warning("reclaimed: %s", keys)
+    except Exception as exc:
+        logger.error("reap error: %s", exc)
+    finally:
+        if db is not None:
+            db.close()
+
+
 def start_background_reaper(session_factory, interval_s: int = 60):
     """FastAPI startup时调用；daemon线程随主进程退出。"""
-    import threading, time
+    import logging
+    import threading
+    import time
+
+    logger = logging.getLogger("reaper")
 
     def _loop():
         while True:
             time.sleep(interval_s)
-            db = session_factory()
-            try:
-                keys = reap_expired(db)
-                if keys:
-                    import logging
-                    logging.getLogger("reaper").warning("reclaimed: %s", keys)
-            except Exception as e:
-                logging.getLogger("reaper").error("reap error: %s", e)
-            finally:
-                db.close()
+            _run_reaper_iteration(session_factory, logger)
 
     th = threading.Thread(target=_loop, daemon=True, name="lease-reaper")
     th.start()
