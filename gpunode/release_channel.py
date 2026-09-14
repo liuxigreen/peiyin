@@ -4,7 +4,7 @@ import base64,hashlib,hmac,io,json,os,re,shutil,stat,subprocess,sys,tempfile,tim
 from pathlib import Path,PurePosixPath
 
 VERSION=re.compile(r"^\d+\.\d+\.\d+(?:\.\d+)?$"); SHA=re.compile(r"^[0-9a-f]{64}$")
-MAX_PACKAGE_BYTES=256*1024*1024; IS_WINDOWS=os.name=="nt"
+MAX_PACKAGE_BYTES=256*1024*1024; MAX_JSON_BYTES=1024*1024; IS_WINDOWS=os.name=="nt"
 class ReleaseError(RuntimeError): pass
 def digest(data): return hashlib.sha256(data).hexdigest()
 def under(child,parent):
@@ -36,6 +36,44 @@ class AllowlistedRedirect(urllib.request.HTTPRedirectHandler):
     def __init__(self,hosts): super().__init__(); self.hosts=hosts
     def redirect_request(self,req,fp,code,msg,headers,newurl): validate_url(newurl,self.hosts); return super().redirect_request(req,fp,code,msg,headers,newurl)
 def _open(request,hosts): return urllib.request.build_opener(AllowlistedRedirect(hosts)).open(request,timeout=30)
+
+class _RejectRedirect(urllib.request.HTTPRedirectHandler):
+    """The control-plane client never follows redirects with a Bearer header."""
+    def redirect_request(self,req,fp,code,msg,headers,newurl):
+        raise ReleaseError("redirect rejected")
+
+def _control_url(url):
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.scheme!="https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ReleaseError("invalid control URL")
+
+def urllib_transport(method,url,headers,payload=None,opener=None):
+    """Small, bounded HTTPS JSON transport used by the production supervisor."""
+    _control_url(url)
+    if method not in {"GET","POST"}: raise ReleaseError("invalid control method")
+    try:
+        body=None if payload is None else json.dumps(payload,separators=(",",":"),allow_nan=False).encode("utf-8")
+    except (TypeError,ValueError,UnicodeError):
+        raise ReleaseError("invalid control JSON") from None
+    request_headers={str(k):str(v) for k,v in headers.items()}
+    request_headers["Accept"]="application/json"
+    if body is not None: request_headers["Content-Type"]="application/json"
+    request=urllib.request.Request(url,data=body,headers=request_headers,method=method)
+    try:
+        response=(opener or urllib.request.build_opener(_RejectRedirect()).open)(request,timeout=30)
+        with response:
+            if getattr(response,"geturl",lambda:url)()!=url: raise ReleaseError("redirect rejected")
+            chunks=[]; total=0
+            while True:
+                chunk=response.read(min(65536,MAX_JSON_BYTES+1-total))
+                if not chunk: break
+                total+=len(chunk)
+                if total>MAX_JSON_BYTES: raise ReleaseError("control response exceeds size limit")
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except ReleaseError: raise
+    except (UnicodeDecodeError,json.JSONDecodeError): raise ReleaseError("invalid control response") from None
+    except Exception: raise ReleaseError("control request failed") from None
 def download_limited(url,hosts,opener=None,max_bytes=MAX_PACKAGE_BYTES):
     validate_url(url,hosts)
     try:
@@ -120,8 +158,9 @@ def pointer(path):
     except FileNotFoundError: return {"current":None,"previous":None}
     if not isinstance(p,dict) or set(p)!={"current","previous"}: raise ReleaseError("invalid release pointer")
     return p
+
 class ReleaseSupervisor:
-    def __init__(self,root,entrypoint,state,popen=subprocess.Popen,clock=time.monotonic,sleeper=time.sleep): self.root=Path(root); self.entrypoint=Path(entrypoint); self.state=state; self.popen=popen; self.clock=clock; self.sleeper=sleeper; self.releases=self.root/"releases"; self.path=self.root/"current.json"; self.child=None
+    def __init__(self,root,entrypoint,state,popen=subprocess.Popen,clock=time.monotonic,sleeper=time.sleep,interpreter=None,base_interpreter=None): self.root=Path(root); self.entrypoint=Path(entrypoint); self.state=state; self.popen=popen; self.clock=clock; self.sleeper=sleeper; self.interpreter=interpreter; self.base_interpreter=base_interpreter; self.releases=self.root/"releases"; self.path=self.root/"current.json"; self.child=None
     def write_pointer(self,current,previous):
         self.root.mkdir(parents=True,exist_ok=True); tmp=self.root/(".pointer-"+uuid.uuid4().hex); tmp.write_text(json.dumps({"current":current,"previous":previous},sort_keys=True)); os.replace(tmp,self.path)
     def install(self,m,package):
@@ -140,7 +179,15 @@ class ReleaseSupervisor:
     def launch(self,version):
         release=self.releases/version
         if not release.is_dir() or not self.entrypoint.is_file(): raise ReleaseError("release launch target unavailable")
-        py=Path(sys.executable).with_name("pythonw.exe") if IS_WINDOWS else Path(sys.executable); code="import runpy,sys;sys.path[:0]="+repr([str(release/"gpunode"),str(self.entrypoint.parent)])+";runpy.run_path("+repr(str(self.entrypoint))+",run_name='__main__')"; env=dict(os.environ);env.setdefault("NODE_WORKDIR",str(self.entrypoint.parent/"workdir"));env.setdefault("NODE_MODEL_MANIFEST",str(self.entrypoint.parent/"models"/"manifest.json")); kw={"close_fds":not IS_WINDOWS,"env":env}
+        if IS_WINDOWS:
+            # CPython's venv launcher redirects python.exe/pythonw.exe to the
+            # base interpreter.  Start that interpreter directly and retain
+            # the venv identity in the documented launcher environment key.
+            py=Path(self.base_interpreter or getattr(sys,"_base_executable",sys.executable))
+        else: py=Path(sys.executable)
+        code="import runpy,sys;sys.path[:0]="+repr([str(release/"gpunode"),str(self.entrypoint.parent)])+";runpy.run_path("+repr(str(self.entrypoint))+",run_name='__main__')"; env=dict(os.environ);env.setdefault("NODE_WORKDIR",str(self.entrypoint.parent/"workdir"));env.setdefault("NODE_MODEL_MANIFEST",str(self.entrypoint.parent/"models"/"manifest.json"))
+        if IS_WINDOWS: env["__PYVENV_LAUNCHER__"]=str(self.interpreter or sys.executable)
+        kw={"close_fds":not IS_WINDOWS,"env":env}
         if IS_WINDOWS:
             kw["creationflags"]=getattr(subprocess,"CREATE_NO_WINDOW",0x08000000); s=subprocess.STARTUPINFO(); s.dwFlags|=subprocess.STARTF_USESHOWWINDOW; s.wShowWindow=0; kw["startupinfo"]=s
         self.child=self.popen([str(py),"-c",code],**kw); return self.child
@@ -189,26 +236,34 @@ class ReleaseSupervisor:
     def update_from_manifest_url(self,url,key,hosts,opener=None):
         m=download_manifest(url,hosts,opener); validate_manifest(m,key,hosts); return self.update(m,download_limited(m["package_url"],hosts,opener),key,hosts)
 def _config(path):
-    c=json.loads(Path(path).read_text(encoding="utf-8"))
+    c=json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not c.get("entrypoint_path") or int(c.get("poll_seconds",900))<1: raise ReleaseError("invalid release configuration")
     if urllib.parse.urlsplit(c.get("control_plane_url","")).scheme!="https": raise ReleaseError("invalid release configuration")
+    interpreter,base=c.get("entrypoint_python_path"),c.get("base_python_path")
+    if (interpreter is None)!=(base is None) or any(not isinstance(value,str) or not value for value in (interpreter,base) if value is not None): raise ReleaseError("invalid release configuration")
     return c
 def main(argv=None, supervisor_factory=None, update=None, sleeper=time.sleep):
     import argparse
     p=argparse.ArgumentParser();p.add_argument("--config",required=True);p.add_argument("--watch",action="store_true");a=p.parse_args(argv)
     try:
         c=_config(a.config); entry=Path(c["entrypoint_path"])
-        sf=supervisor_factory or (lambda: ReleaseSupervisor(Path(a.config).parent,entry,StateClient(c["control_plane_url"],Path(c.get("token_file",entry.parent/"workdir"/"node_token.txt")),urllib_transport)))
+        sf=supervisor_factory or (lambda: ReleaseSupervisor(Path(a.config).parent,entry,StateClient(c["control_plane_url"],Path(c.get("token_file",entry.parent/"workdir"/"node_token.txt")),urllib_transport),interpreter=c.get("entrypoint_python_path"),base_interpreter=c.get("base_python_path")))
         s=sf()
-        while True:
-            s.ensure_current_running()
-            try:
-                if update:update()
-                else:
-                    url,hosts,key=s.state.release_bootstrap();s.update_from_manifest_url(url,key,hosts)
-            except ReleaseError: pass
-            if not a.watch:return 0
-            sleeper(int(c.get("poll_seconds",900)))
-    except (ReleaseError,OSError,json.JSONDecodeError,ValueError) as e:
+    except (ReleaseError,OSError,json.JSONDecodeError,ValueError):
         print("release channel configuration failed",file=sys.stderr);return 2
+    def cycle():
+        s.ensure_current_running()
+        if update:update()
+        else:
+            url,hosts,key=s.state.release_bootstrap();s.update_from_manifest_url(url,key,hosts)
+    if not a.watch:
+        try: cycle()
+        except (ReleaseError,OSError,json.JSONDecodeError,ValueError):
+            print("release channel cycle failed",file=sys.stderr); return 1
+        return 0
+    while True:
+        try: cycle()
+        except (ReleaseError,OSError,json.JSONDecodeError,ValueError):
+            print("release channel cycle failed",file=sys.stderr)
+        sleeper(int(c.get("poll_seconds",900)))
 if __name__=="__main__": sys.exit(main())

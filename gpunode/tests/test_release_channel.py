@@ -54,10 +54,10 @@ def test_stop_timeout_preserves_old_and_does_not_launch(tmp_path):
 def test_installer_activation_guard_order():
  text=(Path(__file__).parents[1]/"scripts"/"install_release_channel.ps1").read_text()
  assert "$taskXml=Join-Path $parent" in text and "$activatedNew=$false" in text
- assert text.index("Move-Item -LiteralPath $stage -Destination $InstallRoot; $activatedNew=$true") < text.index("if($activatedNew -and") < text.index("if($moved){Move-Item")
+ assert text.index("Move-Item -LiteralPath $stage -Destination $InstallRoot") < text.index("if($activatedNew -and") < text.index("if($moved)")
 def test_installer_commit_cleanup_is_outside_rollback():
  text=(Path(__file__).parents[1]/"scripts"/"install_release_channel.ps1").read_text()
- run=text.index("Invoke-Schtasks @('/Run'"); commit=text.index("$committed=$true"); rollback=text.index("if(-not $committed)"); cleanup=text.rindex("try { if($committed")
+ run=text.index("Invoke-Schtasks @('/Run'"); commit=text.index("$committed=$true"); rollback=text.index("if(-not $committed)"); cleanup=text.rindex("try {\n    if($committed")
  assert run < commit < rollback < cleanup
 def test_watch_ensures_before_each_update_and_restarts_only_dead_child(tmp_path):
  key=tmp_path/'key';key.write_text('x');entry=tmp_path/'entry';entry.write_text('pass');cfg=tmp_path/'c.json';cfg.write_text(json.dumps({'control_plane_url':'https://control.example','manifest_url':'https://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_file':str(key),'entrypoint_path':str(entry),'poll_seconds':1}))
@@ -86,8 +86,8 @@ def test_bootstrap_extract_installer_layout_can_start_000(tmp_path):
  state=rc.StateClient('https://control',token,lambda *a:{}) ;s=rc.ReleaseSupervisor(root,entry,state,popen=lambda *a,**k:calls.append(a) or P())
  s.ensure_current_running();assert rc.pointer(root/'current.json')['current']['version']=='0.0.0' and (root/'releases'/'0.0.0').is_dir() and len(calls)==1 and '0.0.0/gpunode' in calls[0][0][2]
 def test_installer_cleanup_block_is_commit_only():
- text=(Path(__file__).parents[1]/'scripts'/'install_release_channel.ps1').read_text();main,cleanup=text.split("try { if($committed",1)
- assert "$committed=$true } catch" in main and "if(-not $committed){if($activatedNew" in main and "Remove-Item -LiteralPath $InstallRoot" in main
+ text=(Path(__file__).parents[1]/'scripts'/'install_release_channel.ps1').read_text();main,cleanup=text.split("try {\n    if($committed",1)
+ assert "$committed=$true" in main and "if(-not $committed)" in main and "Remove-Item -LiteralPath $InstallRoot" in main
  assert '$InstallRoot' not in cleanup.split('catch { }',1)[0] and 'schtasks' not in cleanup.lower() and 'Move-Item -LiteralPath $backup' not in cleanup
 @pytest.mark.parametrize('payload,ok', [({'schema_version':1,'manifest_url':'https://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_b64':'VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ='},True), ({'schema_version':1,'manifest_url':'http://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_b64':'VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ='},False)])
 def test_release_bootstrap_schema(payload,ok,tmp_path):
@@ -147,3 +147,109 @@ def test_main_bootstrap_retries_without_stopping_current_child(tmp_path):
         if len(attempts)>=3: raise Stop()
     with pytest.raises(Stop): rc.main(['--config',str(cfg),'--watch'],supervisor_factory=lambda:s,sleeper=sleep)
     assert len(child)==1 and child[0].poll() is None and len(attempts)==3
+
+
+def test_control_transport_rejects_redirect_bounds_body_and_never_reuses_bearer():
+    seen=[]
+    class R:
+        def __init__(s,body,url='https://control.example/api'):s.body=body;s.url=url
+        def __enter__(s):return s
+        def __exit__(s,*x):pass
+        def geturl(s):return s.url
+        def read(s,n):
+            bit,s.body=s.body[:n],s.body[n:]
+            return bit
+    def opener(request,timeout):
+        seen.append((request.full_url,request.get_header('Authorization')))
+        return R(b'{"ok":true}')
+    assert rc.urllib_transport('GET','https://control.example/api',{'Authorization':'Bearer resident'},opener=opener)=={'ok':True}
+    assert seen==[('https://control.example/api','Bearer resident')]
+    with pytest.raises(rc.ReleaseError):
+        rc.urllib_transport('GET','https://control.example/api',{'Authorization':'Bearer resident'},opener=lambda *a:R(b'{}','https://evil.example/x'))
+    with pytest.raises(rc.ReleaseError):
+        rc.urllib_transport('GET','https://control.example/api',{},opener=lambda *a:R(b'x'*(rc.MAX_JSON_BYTES+1)))
+    with pytest.raises(rc.ReleaseError):
+        rc.urllib_transport('GET','https://control.example/api',{},opener=lambda *a:R(b'not-json'))
+
+
+def test_main_uses_defined_production_transport_and_bom_config(tmp_path,monkeypatch):
+    entry=tmp_path/'entry.py';entry.write_text('pass');token=tmp_path/'token';token.write_text('resident')
+    cfg=tmp_path/'config.json';cfg.write_bytes(b'\xef\xbb\xbf'+json.dumps({'control_plane_url':'https://control.example','entrypoint_path':str(entry),'token_file':str(token),'poll_seconds':1}).encode())
+    assert rc._config(cfg)['entrypoint_path']==str(entry)
+    calls=[]
+    def transport(method,url,headers,payload):
+        calls.append((method,url,headers));return {'schema_version':1,'manifest_url':'https://releases.example/m','allowed_hosts':['releases.example'],'hmac_key_b64':'VFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFQ='}
+    class S:
+        def __init__(s,state):s.state=state
+        def ensure_current_running(s):pass
+        def update_from_manifest_url(s,url,key,hosts):assert (url,hosts)==('https://releases.example/m',{'releases.example'})
+    monkeypatch.setattr(rc,'urllib_transport',transport)
+    monkeypatch.setattr(rc,'ReleaseSupervisor',lambda root,entry,state,**kwargs:S(state))
+    assert rc.main(['--config',str(cfg)])==0
+    assert calls[0][0]=='GET' and calls[0][2]['Authorization']=='Bearer resident'
+
+
+def test_main_one_shot_failure_is_nonzero_watch_retries_without_details(tmp_path,capsys):
+    cfg=tmp_path/'c';cfg.write_text(json.dumps({'control_plane_url':'https://control.example','entrypoint_path':'x','poll_seconds':1}))
+    class S:
+        def ensure_current_running(s):raise rc.ReleaseError('secret-url')
+    assert rc.main(['--config',str(cfg)],supervisor_factory=lambda:S())==1
+    assert 'secret-url' not in capsys.readouterr().err
+    events=[]
+    class Stop(BaseException):pass
+    def sleep(_):
+        events.append('sleep')
+        if len(events)==2:raise Stop()
+    with pytest.raises(Stop):rc.main(['--config',str(cfg),'--watch'],supervisor_factory=lambda:S(),sleeper=sleep)
+    assert events==['sleep','sleep'] and 'secret-url' not in capsys.readouterr().err
+
+
+def test_installer_writes_no_bom_config_and_document_uses_flat_entrypoint():
+    text=(Path(__file__).parents[1]/'scripts'/'install_release_channel.ps1').read_text()
+    doc=(Path(__file__).parents[1]/'RELEASE-3060.md').read_text()
+    assert 'UTF8Encoding($false)' in text and 'WriteAllText($configPath' in text and 'if($committed){ exit 0 }' in text
+    assert "[Alias('PythonwPath')][string]$PythonPath=\"python.exe\"" in text and 'base_python_path=$interpreters.base_executable' in text
+    assert "E:\\peiyin-node\\entrypoint.py" in doc and "E:\\peiyin-node\\gpunode\\entrypoint.py" not in doc
+
+
+def test_windows_bypasses_venv_launcher_and_preserves_venv_environment(tmp_path,monkeypatch):
+    class Startup:
+        def __init__(s):s.dwFlags=0;s.wShowWindow=0
+    class Child:
+        def poll(s):return None
+    monkeypatch.setattr(rc,'IS_WINDOWS',True);monkeypatch.setattr(rc.subprocess,'STARTUPINFO',Startup,raising=False)
+    monkeypatch.setattr(rc.subprocess,'STARTF_USESHOWWINDOW',1,raising=False);monkeypatch.setattr(rc.subprocess,'CREATE_NO_WINDOW',8,raising=False)
+    root=tmp_path/'root';(root/'releases'/'1.2.3').mkdir(parents=True);entry=tmp_path/'entry.py';entry.write_text('pass');calls=[]
+    s=rc.ReleaseSupervisor(root,entry,None,popen=lambda argv,**kw:calls.append((argv,kw)) or Child(),interpreter='E:/node/.venv/Scripts/python.exe',base_interpreter='C:/Python39/python.exe')
+    s.launch('1.2.3')
+    assert calls[0][0][0]=='C:/Python39/python.exe'
+    assert calls[0][1]['env']['__PYVENV_LAUNCHER__']=='E:/node/.venv/Scripts/python.exe'
+    assert calls[0][1]['creationflags']&8 and calls[0][1]['close_fds'] is False
+
+
+def test_main_routes_interpreter_paths_from_config(tmp_path,monkeypatch):
+    entry=tmp_path/'entry';entry.write_text('pass');cfg=tmp_path/'config';cfg.write_text(json.dumps({'control_plane_url':'https://control.example','entrypoint_path':str(entry),'entrypoint_python_path':'E:/venv/python.exe','base_python_path':'C:/Python/python.exe'}))
+    seen={}
+    class S:
+        def ensure_current_running(s):pass
+        class state:
+            @staticmethod
+            def release_bootstrap():return 'https://releases.example/m',{'releases.example'},b'k'*32
+        def update_from_manifest_url(s,*a):pass
+    def factory(root,entry,state,**kwargs):seen.update(kwargs);return S()
+    monkeypatch.setattr(rc,'ReleaseSupervisor',factory)
+    assert rc.main(['--config',str(cfg)])==0
+    assert seen=={'interpreter':'E:/venv/python.exe','base_interpreter':'C:/Python/python.exe'}
+
+
+def test_bootstrap_v2_is_immutable_and_matches_final_sources():
+    root=Path(__file__).parents[2]; artifacts=root/'release-artifacts'
+    v1=artifacts/'node-release-channel-bootstrap-v1.zip';v2=artifacts/'node-release-channel-bootstrap-v2.zip'
+    assert hashlib.sha256(v1.read_bytes()).hexdigest()=='ea12af690d6b824fbb1fc8305d45f400c0ad452be9545ab2bb9eb554242cf7b3'
+    actual=hashlib.sha256(v2.read_bytes()).hexdigest()
+    assert (artifacts/'node-release-channel-bootstrap-v2.sha256').read_text().strip()==actual+'  node-release-channel-bootstrap-v2.zip'
+    expected={'gpunode/bootstrap/current.json','gpunode/bootstrap/releases/0.0.0/.release-meta.json','gpunode/release_channel.py','gpunode/scripts/install_release_channel.ps1','gpunode/RELEASE-3060.md'}
+    with zipfile.ZipFile(v2) as archive:
+        assert set(archive.namelist())==expected
+        for name in ('gpunode/release_channel.py','gpunode/scripts/install_release_channel.ps1','gpunode/RELEASE-3060.md'):
+            assert archive.read(name)==(root/name).read_bytes()

@@ -4,15 +4,15 @@
 
 ## 一次性安装（管理员在 3060 上执行）
 
-解压 `node-release-channel-bootstrap-v1.zip` 后，只需提供既有控制面地址、本机既有节点入口和原来的隐藏常驻任务名：
+解压 `node-release-channel-bootstrap-v2.zip` 后，只需提供既有控制面地址、本机既有节点入口和原来的隐藏常驻任务名：
 
 ```powershell
-.\gpunode\scripts\install_release_channel.ps1 -ControlPlaneUrl 'https://control.example' -EntryPointPath 'E:\peiyin-node\gpunode\entrypoint.py' -InstallRoot 'E:\peiyin-node\release-channel' -ResidentTaskName 'ExistingHiddenNodeTask'
+.\gpunode\scripts\install_release_channel.ps1 -ControlPlaneUrl 'https://control.example' -EntryPointPath 'E:\peiyin-node\entrypoint.py' -InstallRoot 'E:\peiyin-node\release-channel' -ResidentTaskName 'ExistingHiddenNodeTask' -PythonPath 'E:\peiyin-node\.venv\Scripts\python.exe'
 ```
 
 不再人工传入 manifest 地址、允许主机列表或 HMAC key。supervisor 复用节点既有 Bearer token，从控制面一次性 bootstrap 接口取得受限发布地址和仅在内存使用的签名密钥；密钥不会写入配置、日志或 bootstrap。
 
-控制面只会向已明确允许的节点 ID 返回 bootstrap，接口响应禁止缓存。网络或 bootstrap 暂不可用时，supervisor 继续运行本机既有 `0.0.0` 入口并在下一轮重试，不会停止现有节点服务。
+控制面只会向已明确允许的节点 ID 返回 bootstrap，接口响应禁止缓存。网络或 bootstrap 暂不可用时，watch 模式继续运行本机既有 `0.0.0` 入口并在下一轮重试，不会停止现有节点服务；一次性运行会以非零退出码报告失败。
 
 安装器备份同一个既有隐藏 Scheduled Task 定义、停止旧实例，以 sibling staging 原子替换 supervisor 后复用原任务名；任何失败都会恢复任务定义并重启旧 resident。bootstrap 内含 `bootstrap/current.json` 与 `bootstrap/releases/0.0.0/.release-meta.json` 空 overlay。请在维护窗口执行；本变更没有执行真实部署、下载、计划任务或节点操作。
 
@@ -35,4 +35,4 @@ python gpunode/scripts/build_node_release.py --source-root . --output-dir out --
 
 更新前 supervisor 通过 `POST /api/nodes/me/release-state` 报告 draining，并轮询 `GET /api/nodes/me/release-switch-ready`；存在任何运行中的 PipelineTask 或 NodeJob 时不切换。就绪后使用同目录临时文件和 `os.replace` 更新 `current.json`。新隐藏子进程在健康窗口内退出会原子恢复 previous pointer，隐藏重启旧版并报告旧版 ready。
 
-离线检查：`python -m pytest gpunode/tests/test_release_channel.py`，随后计算 bootstrap SHA-256 并与伴随 `.sha256` 比较。测试使用注入 transport、时钟、sleep 和进程工厂，不会联网或启动真实进程。
+离线检查：`python -m pytest gpunode/tests/test_release_channel.py`，随后计算 bootstrap SHA-256 并与伴随 `.sha256` 比较。测试使用注入 transport、时钟、sleep 和进程工厂，不会联网或启动真实进程。`-PythonPath` 指向节点现有 venv 的 `python.exe`；安装器探测其 `sys.executable` 与 `sys._base_executable`，隐藏任务直接执行 base interpreter。supervisor 启动 entrypoint 时也使用同一 CPython bypass pattern，并以 `__PYVENV_LAUNCHER__` 保留 venv 语义。旧自动化可继续使用 `-PythonwPath` alias。
