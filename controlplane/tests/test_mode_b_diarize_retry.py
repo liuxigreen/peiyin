@@ -138,6 +138,19 @@ def test_retry_is_idempotent_after_task_is_pending(tmp_path):
     finally:
         db.close()
 
+    mismatched = client.post(
+        f"/api/projects/{project_id}/mode-b/diarize/retry",
+        json={"task_id": task_id, "uids": list(reversed(uids[:10]))},
+    )
+
+    assert mismatched.status_code == 409
+    db = SessionLocal()
+    try:
+        assert _task_snapshot(db.get(PipelineTask, task_id)) == before_task
+        assert db.get(Project, project_id).config == before_config
+    finally:
+        db.close()
+
     response = client.post(f"/api/projects/{project_id}/mode-b/diarize/retry", json=body)
 
     assert response.status_code == 200

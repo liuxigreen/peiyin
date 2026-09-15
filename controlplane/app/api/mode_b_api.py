@@ -503,6 +503,15 @@ def retry_dead_diarize_task(pid: str, body: dict, db: Session = Depends(get_db))
         raise HTTPException(409, "diarize task does not reference a control-plane artifact")
 
     if task.status == "pending":
+        existing_slots = payload.get("srt_slots")
+        existing_uids = (
+            [slot.get("uid") for slot in existing_slots]
+            if isinstance(existing_slots, list)
+            and all(isinstance(slot, dict) for slot in existing_slots)
+            else None
+        )
+        if existing_uids != uids:
+            raise HTTPException(409, "pending diarize canary does not match requested uids")
         return {"ok": True, "task_id": task.id, "slots": len(uids), "idempotent": True}
     if task.status != "dead":
         raise HTTPException(409, f"diarize task is {task.status}, not dead")
