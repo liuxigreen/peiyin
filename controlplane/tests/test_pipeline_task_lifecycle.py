@@ -326,3 +326,92 @@ def test_backfill_uses_unique_temp_and_preserves_old_artifact_on_stream_failure(
         assert response.status_code == 200, response.text
     assert len(seen) == 2 and seen[0] != seen[1] and all(path.endswith(".backfill") for path in seen)
     assert dest.read_bytes() == b"second"
+
+
+def test_upload_restores_replaced_artifact_when_metadata_commit_fails(tmp_path, monkeypatch):
+    client, SessionLocal, nodes_mod = _client(tmp_path, monkeypatch)
+    token = "commit-failure-owner"
+    owner_id = _node_id(client, SessionLocal, token)
+    task_id = _task(client, SessionLocal, claimed_by=owner_id)
+    dest = _old_artifact(tmp_path, SessionLocal, task_id)
+    before = _snapshot(SessionLocal, task_id)
+
+    class WholeBody:
+        async def stream(self):
+            yield b"new-bytes"
+
+    db = SessionLocal()
+    try:
+        def fail_commit():
+            db.rollback()
+            raise RuntimeError("metadata commit failed")
+
+        monkeypatch.setattr(db, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="metadata commit failed"):
+            asyncio.run(nodes_mod.upload_artifact(
+                task_id, WholeBody(), filename="sound.wav", key="sound",
+                authorization=f"Bearer {token}", db=db))
+    finally:
+        db.close()
+
+    assert dest.read_bytes() == b"old-bytes"
+    assert _snapshot(SessionLocal, task_id) == before
+    assert not list(dest.parent.glob(".*.upload"))
+
+
+def test_backfill_restores_artifact_and_handoff_when_metadata_commit_fails(tmp_path, monkeypatch):
+    client, SessionLocal, nodes_mod = _client(tmp_path, monkeypatch)
+    token = "backfill-commit-failure-owner"
+    owner_id = _node_id(client, SessionLocal, token)
+    task_id = _task(client, SessionLocal, status="completed", claimed_by=owner_id,
+                    task_type="separate-vocals")
+    dest = _old_artifact(tmp_path, SessionLocal, task_id, key="vocals", filename="vocals.wav")
+    before = _snapshot(SessionLocal, task_id)
+
+    class WholeBody:
+        async def stream(self):
+            yield b"new-backfill"
+
+    db = SessionLocal()
+    try:
+        def fail_commit():
+            db.rollback()
+            raise RuntimeError("backfill metadata commit failed")
+
+        monkeypatch.setattr(db, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="backfill metadata commit failed"):
+            asyncio.run(nodes_mod.backfill_separation_artifact(
+                task_id, WholeBody(), filename="vocals.wav", key="vocals",
+                authorization=f"Bearer {token}", db=db))
+    finally:
+        db.close()
+
+    assert dest.read_bytes() == b"old-bytes"
+    assert _snapshot(SessionLocal, task_id) == before
+    assert not list(dest.parent.glob(".*.backfill"))
+    from app.db.models import PipelineTask
+    db = SessionLocal()
+    try:
+        assert db.query(PipelineTask).filter_by(task_type="diarize").count() == 0
+    finally:
+        db.close()
+
+
+def test_backfill_refuses_an_overlapping_final_replacement(tmp_path, monkeypatch):
+    client, SessionLocal, _nodes_mod = _client(tmp_path, monkeypatch)
+    token = "locked-backfill-owner"
+    owner_id = _node_id(client, SessionLocal, token)
+    headers = {"Authorization": f"Bearer {token}"}
+    task_id = _task(client, SessionLocal, status="completed", claimed_by=owner_id,
+                    task_type="separate-vocals")
+    dest = _old_artifact(tmp_path, SessionLocal, task_id, key="vocals", filename="vocals.wav")
+    before = _snapshot(SessionLocal, task_id)
+    lock = dest.with_name(f"{dest.name}.lock")
+    lock.write_text("in progress")
+
+    response = client.post(f"/api/nodes/tasks/{task_id}/artifact-backfill", headers=headers,
+                           params={"key": "vocals", "filename": "vocals.wav"}, content=b"racing")
+    assert response.status_code == 409, response.text
+    assert dest.read_bytes() == b"old-bytes"
+    assert _snapshot(SessionLocal, task_id) == before
+    assert not list(dest.parent.glob(".*.backfill"))

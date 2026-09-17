@@ -2,7 +2,7 @@
 register / claim(原子领取) / heartbeat / complete / fail / 节点列表
 生产Postgres走 SKIP LOCKED（app/core/queue.py），sqlite退化用事务内
 status条件更新实现同语义——两方言均保证不重复派发。"""
-import base64, binascii, hashlib, json as _json, os, re as _re, secrets
+import base64, binascii, hashlib, json as _json, os, re as _re, secrets, shutil
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
@@ -419,6 +419,55 @@ def _artifact_url(task_id: str, key: str, filename: str) -> str:
     return f"/api/nodes/tasks/{task_id}/artifacts/{key}/{filename}"
 
 
+def _artifact_backup(dest: str) -> str | None:
+    """Copy an existing artifact so a synchronous DB failure can be reversed."""
+    if not os.path.exists(dest):
+        return None
+    backup = os.path.join(
+        os.path.dirname(dest), f".{os.path.basename(dest)}.{secrets.token_hex(16)}.backup"
+    )
+    with open(dest, "rb") as source, open(backup, "xb") as copy:
+        shutil.copyfileobj(source, copy)
+    return backup
+
+
+def _restore_artifact(dest: str, backup: str | None) -> None:
+    """Undo a replacement after the current transaction has rolled back."""
+    if backup is not None:
+        os.replace(backup, dest)
+    elif os.path.exists(dest):
+        os.remove(dest)
+
+
+def _discard_artifact_backup(backup: str | None) -> None:
+    if backup is not None and os.path.exists(backup):
+        try:
+            os.remove(backup)
+        except OSError:
+            # The committed artifact and metadata are authoritative; a stale
+            # private backup can be collected later without changing that fact.
+            pass
+
+
+def _acquire_artifact_lock(dest: str) -> str:
+    """Serialize final replacement for one legacy backfill artifact."""
+    lock = f"{dest}.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise HTTPException(409, "artifact upload is already in progress") from exc
+    os.close(fd)
+    return lock
+
+
+def _release_artifact_lock(lock: str | None) -> None:
+    if lock is not None and os.path.exists(lock):
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
 def _queue_diarize_handoff(db: Session, source: "m.PipelineTask") -> None:
     """仅在 control-plane vocals artifact 已持久化后排入 diarize。
 
@@ -605,12 +654,23 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
         if os.path.exists(temporary):
             os.remove(temporary)
         raise HTTPException(409, "task ownership or state changed during artifact upload")
-    os.replace(temporary, dest)
-    db.expire_all()
-    t = db.get(m.PipelineTask, task_id)
-    clip_info = _upsert_tts_clip(db, t, dest)
-    _queue_diarize_handoff(db, t)
-    db.commit()
+    backup = None
+    replaced = False
+    try:
+        backup = _artifact_backup(dest)
+        os.replace(temporary, dest)
+        replaced = True
+        db.expire_all()
+        t = db.get(m.PipelineTask, task_id)
+        clip_info = _upsert_tts_clip(db, t, dest)
+        _queue_diarize_handoff(db, t)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        if replaced:
+            _restore_artifact(dest, backup)
+        raise
+    _discard_artifact_backup(backup)
     return {"ok": True, "artifact": entry, "tts_clip": clip_info}
 
 
@@ -704,6 +764,9 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
     # 且每请求唯一，才能让 os.replace 保持替换边界。
     temporary = os.path.join(dest_dir, f".{filename}.{secrets.token_hex(16)}.backfill")
     size = 0
+    backup = None
+    replaced = False
+    lock = None
     try:
         with open(temporary, "wb") as f:
             async for chunk in request.stream():
@@ -711,44 +774,51 @@ async def backfill_separation_artifact(task_id: str, request: "Request", filenam
                 if size > _ART_MAX_MB << 20:
                     raise HTTPException(413, f"artifact exceeds {_ART_MAX_MB}MB")
                 f.write(chunk)
+        lock = _acquire_artifact_lock(dest)
+        backup = _artifact_backup(dest)
         os.replace(temporary, dest)
+        replaced = True
+        entry = {"key": key, "filename": filename, "path": dest, "bytes": size}
+        outputs = dict(task.output_paths or {})
+        artifacts = [artifact for artifact in (outputs.get("artifacts") or [])
+                     if artifact.get("key") != key]
+        artifacts.append(entry)
+        outputs["artifacts"] = artifacts
+        task.output_paths = outputs
+        if job is not None:
+            # Upload persists only the artifact and a durable checkpoint.  A
+            # consumer appears only when the running job is explicitly completed.
+            job.checkpoint = {"artifact": {"key": key, "filename": filename, "bytes": size}}
+        else:
+            _queue_diarize_handoff(db, task)
+        if grant is not None:
+            # The source task lifecycle is intentionally untouched.  Consumption is
+            # recorded only after the artifact has reached control-plane storage.
+            grant.state = "consumed"
+            grant.consumed_by_node_id = node.id
+            grant.consumed_at = datetime.now(timezone.utc)
+            grant.filename = filename
+            grant.byte_count = size
+            grant.result = "uploaded"
+            grant.result_detail = None
+        db.commit()
     except BaseException:
+        db.rollback()
         if os.path.exists(temporary):
             os.remove(temporary)
+        if replaced:
+            _restore_artifact(dest, backup)
         if grant is not None:
-            db.rollback()
             grant = db.get(m.LegacyArtifactBackfillGrant, reserved_grant_id)
             if grant is not None and grant.state == "uploading":
                 grant.state = "issued"
                 grant.result = "upload_failed"
                 grant.result_detail = "artifact stream failed"
                 db.commit()
+        _release_artifact_lock(lock)
         raise
-
-    entry = {"key": key, "filename": filename, "path": dest, "bytes": size}
-    outputs = dict(task.output_paths or {})
-    artifacts = [artifact for artifact in (outputs.get("artifacts") or [])
-                 if artifact.get("key") != key]
-    artifacts.append(entry)
-    outputs["artifacts"] = artifacts
-    task.output_paths = outputs
-    if job is not None:
-        # Upload persists only the artifact and a durable checkpoint.  A
-        # consumer appears only when the running job is explicitly completed.
-        job.checkpoint = {"artifact": {"key": key, "filename": filename, "bytes": size}}
-    else:
-        _queue_diarize_handoff(db, task)
-    if grant is not None:
-        # The source task lifecycle is intentionally untouched.  Consumption is
-        # recorded only after the artifact has reached control-plane storage.
-        grant.state = "consumed"
-        grant.consumed_by_node_id = node.id
-        grant.consumed_at = datetime.now(timezone.utc)
-        grant.filename = filename
-        grant.byte_count = size
-        grant.result = "uploaded"
-        grant.result_detail = None
-    db.commit()
+    _discard_artifact_backup(backup)
+    _release_artifact_lock(lock)
     return {"ok": True, "artifact": entry}
 
 
