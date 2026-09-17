@@ -2,11 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, upgrade/seam-wave1]
   pull_request:
 
 jobs:
-  test:
+  python:
     strategy:
       fail-fast: false
       matrix:
@@ -17,14 +17,40 @@ jobs:
         working-directory: controlplane
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - name: Setup venv
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install runtime and test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Install ffmpeg and ffprobe
+        shell: pwsh
         run: |
-          uv venv .venv
-          uv pip install --python .venv/bin/python -r requirements.txt || uv pip install --python .venv/Scripts/python.exe -r requirements.txt
-      - name: Run tests
+          if ($IsLinux) { sudo apt-get update; sudo apt-get install -y ffmpeg }
+          elseif ($IsMacOS) { brew install ffmpeg }
+          elseif ($IsWindows) { choco install ffmpeg --yes --no-progress }
+          else { throw "Unsupported runner OS" }
+          ffmpeg -version
+          ffprobe -version
+      - name: Run controlplane and node tests
+        env:
+          PYTHONPATH: ../gpunode
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -p no:cacheprovider tests ../gpunode/tests -q
+      - name: Offline end-to-end smoke
+        env:
+          NODE_MODE: offline
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python scripts/offline_e2e.py
+      - name: Validate release candidate archive
+        working-directory: .
+        run: python scripts/release_smoke.py
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install locked frontend dependencies and build outside tracked dist
+        working-directory: frontend
         run: |
-          .venv/bin/python -m pytest tests/ -q || .venv/Scripts/python.exe -m pytest tests/ -q
-      - name: Offline E2E
-        run: |
-          .venv/bin/python scripts/offline_e2e.py || .venv/Scripts/python.exe scripts/offline_e2e.py
+          bun install --frozen-lockfile
+          bun run build --outDir "$RUNNER_TEMP/frontend-dist"

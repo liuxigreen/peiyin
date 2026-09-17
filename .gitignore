@@ -26,6 +26,10 @@ node_modules/
 frontend/dist/
 # controlplane/web/dist 保留：云端部署即含前端构建产物
 
+# --- 保留在本机、绝不进入源提交的发布输入/旧构建 ---
+/assets/zh_audio.mp3
+/controlplane/web/dist.old/
+
 # --- 系统 ---
 .DS_Store
 HANDOVER-B8.md

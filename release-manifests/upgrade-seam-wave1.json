@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "snapshot_kind": "release-readiness-baseline",
+  "branch": "upgrade/seam-wave1",
+  "source": {
+    "observed_preparation_base": "29ab146271daf188c9c91864945a72b4364a0dc8",
+    "origin_at_audit": "29ab146271daf188c9c91864945a72b4364a0dc8",
+    "verified_by": "git ls-remote origin refs/heads/upgrade/seam-wave1",
+    "release_candidate": "the Git commit containing this manifest; scripts/release_smoke.py emits its exact candidate_commit",
+    "candidate_relation_to_origin_at_audit": "one local hygiene commit ahead; unpushed"
+  },
+  "artifacts": {
+    "node_release_channel_bootstrap_v1_sha256": "ea12af690d6b824fbb1fc8305d45f400c0ad452be9545ab2bb9eb554242cf7b3",
+    "node_release_channel_bootstrap_v2_sha256": "41cac276a0a9cfa7aaf1126d66743a18d1f042d1d20ea8c3bf1151c510ecfbf6",
+    "published_node_release_1_0_0_sha256": "a4b7b6de71e5419a91b2f00eddcc86748e1565e1841df0e176167d0be315a1e1",
+    "published_node_release_scope": "historical node payload; not a full-repository release for the source baseline"
+  },
+  "protected_local_data": [
+    "assets/zh_audio.mp3",
+    "controlplane/web/dist.old/**"
+  ],
+  "ecs": {
+    "worktree": "/opt/peiyin",
+    "head": "53235adb7399eaf7503dedf66512e599e80e6fa1",
+    "dirty": true,
+    "state": "diverged dirty deployment snapshot, preserve/do not sync",
+    "tracked_drift": [
+      ".gitignore",
+      "HANDOVER-0902.md",
+      "controlplane/app/**",
+      "controlplane/tests/**",
+      "controlplane/web/dist/**",
+      "gpunode/entrypoint.py",
+      "gpunode/stages/diarize_node.py",
+      "gpunode/stages/separate_node.py"
+    ],
+    "untracked_drift": [
+      "backup files",
+      "local documentation",
+      "controlplane and gpunode source/tests",
+      "frontend distribution backups"
+    ]
+  },
+  "policy": {
+    "no_sync": true,
+    "no_deploy": true,
+    "manual_external_steps": [
+      "Validate the final Git candidate with scripts/release_smoke.py in a clean checkout.",
+      "Review the candidate-bound JSON and all release artifacts.",
+      "Have the deployment owner plan and execute any ECS deployment separately."
+    ]
+  }
+}
