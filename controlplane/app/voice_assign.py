@@ -57,6 +57,7 @@ def assign_voice(db: Session, project: Project, speaker: Speaker | None) -> dict
     if out["ref_audio"] is None:
         g = (meta.get("gender") or "") if isinstance(meta, dict) else ""
         want = "female" if g == "female" else "male"
+        fb: VoiceAsset | None = None
         for a in db.query(VoiceAsset).all():
             if want in set(a.tags or []):
                 fb = a

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from .db.models import PipelineTask, Translation, Utterance
+from .db.models import PipelineTask, Translation, TtsClip, Utterance
 from .render import ffmpeg_bin
 
 log = logging.getLogger("qc_agent")
@@ -63,23 +63,53 @@ def qc_translate(task: PipelineTask, db: Session) -> dict:
 
 
 def qc_tts(task: PipelineTask, db: Session) -> dict:
-    """TTS：每句音频存在/时长比∈[0.8,1.2]（假stage产出也走此检查）。"""
+    """TTS：只接受已落盘、已关联 utterance 的真实音频。
+
+    ``complete`` 可以早于 artifact 上传，因此在 clip 尚未落库时必须明确
+    失败且保持 completed，允许节点继续上传；上传成功后由节点端点再次调用
+    本钩子，以音频实际时长与所属 utterance 的时窗比较。
+    """
     import soundfile as sf
     outputs = task.output_paths or {}
-    clips = outputs.get("clips", []) if isinstance(outputs, dict) else []
-    bad = []
-    for c in clips:
-        path = c.get("path", "")
-        expect = c.get("expect_ms", 0)
-        if not path or not Path(path).exists():
-            bad.append(f"{c.get('uid')}:缺文件")
-            continue
-        info = sf.info(path)
-        ratio = info.frames / info.samplerate * 1000 / max(expect, 1)
-        if not (0.5 <= ratio <= 1.5):     # 假TTS放宽窗；真CosyVoice2收紧[0.8,1.2]
-            bad.append(f"{c.get('uid')}:ratio={ratio:.2f}")
-    return {"pass": not bad, "checks": [_check("时长比窗内", not bad, ";".join(bad[:5]))],
-            "action": "none" if not bad else "rerun"}
+    payload = outputs.get("payload") if isinstance(outputs, dict) else None
+    uid_ = payload.get("uid") if isinstance(payload, dict) else None
+    utterance = (db.query(Utterance)
+                 .filter_by(project_id=task.project_id, uid=uid_).first()) if uid_ else None
+    window_ms = ((utterance.end_ms or 0) - (utterance.start_ms or 0)) if utterance else 0
+    artifacts = outputs.get("artifacts") or [] if isinstance(outputs, dict) else []
+    artifact_paths = {
+        item.get("path") for item in artifacts if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+    }
+    clips = (db.query(TtsClip)
+             .filter_by(utterance_id=utterance.id, status="completed").all()) if utterance else []
+    clip = next((row for row in clips if row.audio_r2_key in artifact_paths), None)
+
+    checks = [
+        _check("utterance时窗有效", window_ms > 0,
+               f"uid={uid_ or '-'}, window_ms={window_ms}"),
+        _check("真实artifact与TtsClip已落盘", clip is not None,
+               f"artifacts={len(artifact_paths)}, clips={len(clips)}"),
+    ]
+    actual_ms = 0
+    if clip is not None:
+        path = clip.audio_r2_key
+        try:
+            info = sf.info(path)
+            actual_ms = int(info.frames / info.samplerate * 1000)
+        except Exception as exc:  # noqa: BLE001
+            checks.append(_check("音频可解析", False, str(exc)[:120]))
+        else:
+            checks.append(_check("音频可解析", actual_ms > 0,
+                                 f"path={path}, actual_ms={actual_ms}"))
+    else:
+        checks.append(_check("音频可解析", False, "尚无已关联的真实artifact"))
+    ratio = actual_ms / window_ms if window_ms > 0 else 0
+    checks.append(_check("实际时长比∈[0.8,1.2]", 0.8 <= ratio <= 1.2,
+                         f"actual_ms={actual_ms}, window_ms={window_ms}, ratio={ratio:.3f}"))
+    ok = all(check["ok"] for check in checks)
+    # 失败时不重入队：节点完成后仍须能够回传或替换控制面 artifact。
+    return {"pass": ok, "checks": checks, "action": "none" if ok else "review"}
 
 
 def qc_render(task: PipelineTask, db: Session) -> dict:
@@ -119,6 +149,7 @@ _HOOKS = {
     "merge-dubtrack": qc_translate,
     "syllable-check": qc_translate,
     "tts": qc_tts,
+    "tts-generate": qc_tts,
     "mix": qc_render,
     "encode": qc_render,
     "stitch": qc_render,

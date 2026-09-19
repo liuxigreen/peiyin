@@ -663,6 +663,13 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
         db.expire_all()
         t = db.get(m.PipelineTask, task_id)
         clip_info = _upsert_tts_clip(db, t, dest)
+        qc = None
+        if t.task_type == "tts-generate" and t.status == "completed":
+            # SessionLocal disables autoflush; QC must observe the just-created
+            # clip rather than treating the durable artifact as an empty set.
+            db.flush()
+            from ..qc_agent import run_qc_hook
+            qc = run_qc_hook(t, db)
         _queue_diarize_handoff(db, t)
         db.commit()
     except BaseException:
@@ -671,7 +678,9 @@ async def upload_artifact(task_id: str, request: "Request", filename: str = "",
             _restore_artifact(dest, backup)
         raise
     _discard_artifact_backup(backup)
-    return {"ok": True, "artifact": entry, "tts_clip": clip_info}
+    return {"ok": True, "artifact": entry, "tts_clip": clip_info,
+            "qc_pass": qc["pass"] if qc is not None else None,
+            "qc_action": qc["action"] if qc is not None else None}
 
 
 @router.post("/tasks/{task_id}/artifact-backfill")

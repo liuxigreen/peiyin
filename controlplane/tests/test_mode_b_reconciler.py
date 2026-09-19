@@ -1,4 +1,5 @@
 """Persisted-state coverage for the pure Mode B reconciler."""
+import wave
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -45,6 +46,14 @@ def _ready_global_gates(db: Session, project: Project):
     _task(db, project, "diarize", "diarize", outputs={"artifacts": [
         {"key": "diarize_result", "href": "/artifact/diarize"}]})
     db.commit()
+
+
+def _write_wav(path, duration_ms: int) -> None:
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16000)
+        audio.writeframes(b"\0\0" * (duration_ms * 16))
 
 
 def test_canary_order_is_idempotent_and_does_not_read_unselected_work(tmp_path):
@@ -120,28 +129,42 @@ def test_tts_qc_and_clip_gate_package_and_dead_task_blocks(tmp_path):
         ]
         db.add_all(translations)
         db.flush()
+        first_wav = tmp_path / "u1.wav"
+        second_wav = tmp_path / "u2.wav"
+        _write_wav(first_wav, 1000)
+        _write_wav(second_wav, 250)
         tasks = [
-            _task(db, project, "tts-generate", "tts-1", outputs={"payload": {"uid": "U1"},
-                                                                      "qc": {"pass": True}}),
-            _task(db, project, "tts-generate", "tts-2", outputs={"payload": {"uid": "U2"},
-                                                                      "qc": {"pass": False}}),
+            _task(db, project, "tts-generate", "tts-1", outputs={
+                "payload": {"uid": "U1"},
+                "artifacts": [{"key": "tts", "path": str(first_wav)}],
+            }),
+            _task(db, project, "tts-generate", "tts-2", outputs={
+                "payload": {"uid": "U2"},
+                "artifacts": [{"key": "tts", "path": str(second_wav)}],
+            }),
         ]
         db.add_all([
             TtsClip(utterance_id=utterances[0].id, target_lang="en", translation_id=translations[0].id,
-                    version=1, audio_r2_key="clips/u1.wav", duration_ms=100, tts_engine="test",
+                    version=1, audio_r2_key=str(first_wav), duration_ms=1000, tts_engine="test",
                     status="completed"),
             TtsClip(utterance_id=utterances[1].id, target_lang="en", translation_id=translations[1].id,
-                    version=1, audio_r2_key="clips/u2.wav", duration_ms=100, tts_engine="test",
+                    version=1, audio_r2_key=str(second_wav), duration_ms=250, tts_engine="test",
                     status="completed"),
         ])
         db.commit()
+
+        from app.qc_agent import run_qc_hook
+        assert run_qc_hook(tasks[0], db)["pass"] is True
+        failed_qc = run_qc_hook(tasks[1], db)
+        assert failed_qc["pass"] is False
+        assert failed_qc["action"] == "review"
 
         qc_blocked = inspect_mode_b_run(db, project)
         assert qc_blocked["state"] == "blocked" and qc_blocked["phase"] == "tts"
         assert qc_blocked["blocked_reason"]
 
-        tasks[1].output_paths = {"payload": {"uid": "U2"}, "qc": {"pass": True}}
-        db.commit()
+        _write_wav(second_wav, 1000)
+        assert run_qc_hook(tasks[1], db)["pass"] is True
         package = inspect_mode_b_run(db, project)
         assert package["state"] == "ready" and package["next_action"] == "package"
         assert package["counts"]["tts_qc_passed"] == 2

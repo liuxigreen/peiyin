@@ -165,6 +165,7 @@ def test_artifact_upload_and_tts_clip(tmp_path):
     r = c.post(f"/api/nodes/tasks/{tid}/complete", headers=H,
                json={"outputs": [{"key": "tts", "path": "/node/out/tts_x.wav"}]})
     assert r.status_code == 200, r.text
+    assert r.json()["qc_pass"] is False, r.json()
     from app.db.models import PipelineTask, TtsClip
     from app.db.session import SessionLocal
     db = SessionLocal()
@@ -190,6 +191,7 @@ def test_artifact_upload_and_tts_clip(tmp_path):
     body = r.json()
     assert body["artifact"]["bytes"] == len(data), body
     assert body["tts_clip"] and body["tts_clip"]["duration_ms"] == 500, body
+    assert body["qc_pass"] is False, body
     db = SessionLocal()
     try:
         t = db.get(PipelineTask, tid)
@@ -203,6 +205,99 @@ def test_artifact_upload_and_tts_clip(tmp_path):
         assert clips, "tts_clips row missing"
         assert clips[0].status == "completed" and clips[0].duration_ms == 500
         assert clips[0].audio_r2_key.endswith("seg.wav")
+    finally:
+        db.close()
+
+
+def test_tts_qc_recomputes_from_uploaded_wav_before_mode_b_package(tmp_path):
+    os.environ["MODE_B_STORAGE"] = str(tmp_path / "storage")
+    c = _client(str(tmp_path / "tts-qc.db"))
+    pid = _seed_translated(c, "TTS真实质检剧")
+    from app.db.models import PipelineTask, Project, Speaker, Utterance
+    from app.db.session import SessionLocal
+    from app.mode_b_reconciler import inspect_mode_b_run
+
+    db = SessionLocal()
+    try:
+        project = db.get(Project, pid)
+        selected = (db.query(Utterance).filter_by(project_id=pid)
+                    .order_by(Utterance.seq_index).limit(2).all())
+        project.config = {"mode_b_run": {"canary_uids": [u.uid for u in selected]}}
+        db.add(Speaker(id="tts-qc-speaker", project_id=pid, label="QC"))
+        for utterance in selected:
+            utterance.speaker_id = "tts-qc-speaker"
+        db.add_all([
+            PipelineTask(project_id=pid, task_key="qc-separate", task_type="separate-vocals",
+                         status="completed", output_paths={"artifacts": [
+                             {"key": "vocals", "href": "/artifact/vocals"}]}),
+            PipelineTask(project_id=pid, task_key="qc-diarize", task_type="diarize",
+                         status="completed", output_paths={"artifacts": [
+                             {"key": "diarize_result", "href": "/artifact/diarize"}]}),
+        ])
+        db.commit()
+        selected_uids = [u.uid for u in selected]
+    finally:
+        db.close()
+
+    task_ids = []
+    for uid_ in selected_uids:
+        created = c.post(f"/api/projects/{pid}/mode-b/tts-task",
+                         json={"uid": uid_, "engine": "mock"}).json()
+        assert created["ok"], created
+        task_ids.append(created["task_id"])
+    headers = {"Authorization": "Bearer tts-qc-node"}
+    claimed_ids = []
+    for _ in task_ids:
+        assert c.post("/api/nodes/heartbeat", headers=headers,
+                      json={"capabilities": ["tts"]}).status_code == 200
+        claimed = c.get("/api/nodes/me/claim", headers=headers)
+        assert claimed.status_code == 200, claimed.text
+        task_id = claimed.json()["task"]["id"]
+        assert task_id in task_ids and task_id not in claimed_ids, claimed.json()
+        claimed_ids.append(task_id)
+    for task_id in claimed_ids:
+        completed = c.post(f"/api/nodes/tasks/{task_id}/complete", headers=headers,
+                           json={"outputs": [{"key": "tts", "path": "/node/tts.wav"}]})
+        assert completed.status_code == 200, completed.text
+        assert completed.json() == {"ok": True, "qc_pass": False, "qc_action": "review"}
+
+    db = SessionLocal()
+    try:
+        blocked = inspect_mode_b_run(db, db.get(Project, pid))
+        assert blocked["state"] == "blocked" and blocked["phase"] == "tts", blocked
+        assert blocked["counts"]["tts_qc_passed"] == 0, blocked
+    finally:
+        db.close()
+
+    import numpy as np
+    import soundfile as sf
+    good_wav = tmp_path / "good.wav"
+    short_wav = tmp_path / "short.wav"
+    sf.write(str(good_wav), np.zeros(32000, dtype="float32"), 16000)
+    sf.write(str(short_wav), np.zeros(8000, dtype="float32"), 16000)
+    first = c.post(f"/api/nodes/tasks/{task_ids[0]}/artifact", headers=headers,
+                   params={"filename": "first.wav", "key": "tts"}, content=good_wav.read_bytes())
+    assert first.status_code == 200 and first.json()["qc_pass"] is True, first.text
+    second = c.post(f"/api/nodes/tasks/{task_ids[1]}/artifact", headers=headers,
+                    params={"filename": "second.wav", "key": "tts"}, content=short_wav.read_bytes())
+    assert second.status_code == 200 and second.json()["qc_pass"] is False, second.text
+
+    db = SessionLocal()
+    try:
+        blocked = inspect_mode_b_run(db, db.get(Project, pid))
+        assert blocked["state"] == "blocked" and blocked["phase"] == "tts", blocked
+        assert blocked["counts"]["tts_qc_passed"] == 1, blocked
+    finally:
+        db.close()
+
+    repaired = c.post(f"/api/nodes/tasks/{task_ids[1]}/artifact", headers=headers,
+                      params={"filename": "second.wav", "key": "tts"}, content=good_wav.read_bytes())
+    assert repaired.status_code == 200 and repaired.json()["qc_pass"] is True, repaired.text
+    db = SessionLocal()
+    try:
+        ready = inspect_mode_b_run(db, db.get(Project, pid))
+        assert ready["state"] == "ready" and ready["next_action"] == "package", ready
+        assert ready["counts"]["tts_qc_passed"] == ready["counts"]["clips_completed"] == 2
     finally:
         db.close()
 
