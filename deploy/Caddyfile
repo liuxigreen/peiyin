@@ -1,6 +1,6 @@
-dubbing.opspilot.me {
-    basicauth {
-        ops {$DUBBING_BASIC_USER}
+:80 {
+    basic_auth {
+        ops {$DUBBING_BASIC_PASSWORD_HASH}
     }
     reverse_proxy controlplane:8500
 }

@@ -19,12 +19,9 @@ uv run ... python scripts/seed_demo.py   # 同上依赖
 cd gpunode && CONTROL_URL=http://<控制机>:8500 NODE_SHARED_SECRET=<secret> ./join.sh
 ```
 
-## 生产部署（云端VPS）
+## 生产部署（云端 VPS）
 
-```bash
-cd deploy && cp env.example .env  # 填好密钥
-docker compose up -d              # Caddy(443) + controlplane + postgres
-```
+参见 [deploy/README.md](deploy/README.md)。当前部署为 SQLite + 本地持久目录、Caddy 身份验证和独立 HTTPS 入口；GPU 节点通过私有网络访问控制面。
 
 ## Clean checkout 验证与候选打包
 

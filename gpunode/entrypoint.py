@@ -1,6 +1,6 @@
 """gpunode 主循环：register→claim→dispatch→heartbeat线程。
 模型层(stages/*)真实加载放G0(GPU机器就位后)。此骨架完成协议闭环可自测。"""
-import os, sys, threading, time, httpx, json
+import os, sys, threading, time, httpx, json, platform
 
 try:
     from . import node_jobs
@@ -60,8 +60,8 @@ def register():
             except Exception:
                 pass          # token失效/网络抖动→走重新register
     r = HTTP.post(f"{CONTROL}/api/nodes/register",
-                   headers={"x-node-secret": NODE_SHARED_SECRET},
-                   json={"name": os.uname().nodename, "gpu_model": os.getenv("GPU_MODEL", "?"),
+                   headers={"x-node-secret": NODE_SECRET},
+                   json={"name": platform.node(), "gpu_model": os.getenv("GPU_MODEL", "?"),
                          "vram_gb": int(os.getenv("GPU_VRAM", "0")),
                          "capabilities": advertised_capabilities()})
     r.raise_for_status()
