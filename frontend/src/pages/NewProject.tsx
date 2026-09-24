@@ -90,9 +90,9 @@ export default function NewProject() {
           上传中文字幕 SRT + 中文配音音频 → 翻译出外语字幕 + 分句外语配音交付包。无需视频，交付快。
         </p>
       </div>
-      <div className={'card' + (mode === 'A' ? ' sel' : '')} onClick={() => !busy && setMode('A')}>
+      <div className="card" aria-disabled="true" style={{ opacity: 0.55, cursor: 'not-allowed' }}>
         <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <IcFilm />模式A · 完整流程
+          <IcFilm />模式A · 完整流程 <span className="badge pending">暂不开放</span>
         </h3>
         <p className="dim" style={{ marginTop: 6, fontSize: 12.5 }}>
           上传视频母片走全流程 → 直接出配音成片视频。GPU 环节接入中，当前先登记素材。
