@@ -21,7 +21,7 @@ cd gpunode && CONTROL_URL=http://<控制机>:8500 NODE_SHARED_SECRET=<secret> ./
 
 ## 生产部署（云端 VPS）
 
-参见 [deploy/README.md](deploy/README.md)。当前部署为 SQLite + 本地持久目录、Caddy 身份验证和独立 HTTPS 入口；GPU 节点通过私有网络访问控制面。
+参见 [deploy/README.md](deploy/README.md)。当前部署为 SQLite + 本地持久目录、Caddy 与独立 HTTPS 入口；GPU 节点通过私有网络访问控制面。
 
 ## Clean checkout 验证与候选打包
 

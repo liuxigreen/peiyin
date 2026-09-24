@@ -4,8 +4,6 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:80"
-    environment:
-      DUBBING_BASIC_PASSWORD_HASH: ${DUBBING_BASIC_PASSWORD_HASH:?set a Caddy password hash}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
