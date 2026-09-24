@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+import tempfile
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
@@ -55,8 +56,15 @@ async def upload_audio_file(pid: str, file: UploadFile = File(...),
     os.makedirs(dest_dir, exist_ok=True)
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
     dest = os.path.join(dest_dir, f"zh_audio{suffix}")
-    with open(dest, "wb") as f:
-        f.write(await file.read())
+    fd, staging = tempfile.mkstemp(prefix=".zh_audio-", dir=dest_dir)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                output.write(chunk)
+        os.replace(staging, dest)
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
     cfg = dict(p.config or {})
     cfg["mode_b_audio"] = dest
     p.config = cfg
