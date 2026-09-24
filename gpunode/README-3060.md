@@ -35,14 +35,14 @@ pip install openaudio
 ### 4. 启动节点 Worker（保持引擎服务在跑）
 ```bash
 # Linux/macOS
-CONTROL_URL=https://dubbing.mulan.dpdns.org \
-NODE_SHARED_SECRET=<问管理员要，或先用 dev-node-secret> \
+CONTROL_URL=http://100.109.28.46:8500 \
+NODE_SHARED_SECRET=<与新控制面相同的生产密钥> \
 NODE_MODE=real GPU_MODEL="RTX 3060" GPU_VRAM=12 \
 python entrypoint.py
 
 # Windows PowerShell
-$env:CONTROL_URL="https://dubbing.mulan.dpdns.org"
-$env:NODE_SHARED_SECRET="dev-node-secret"
+$env:CONTROL_URL="http://100.109.28.46:8500"
+$env:NODE_SHARED_SECRET="<与新控制面相同的生产密钥>"
 $env:NODE_MODE="real"; $env:GPU_MODEL="RTX 3060"; $env:GPU_VRAM="12"
 python entrypoint.py
 ```

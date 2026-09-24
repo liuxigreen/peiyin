@@ -50,10 +50,11 @@ def _auth_node(db: Session, authorization: str) -> m.GpuNode:
     tok = authorization.removeprefix("Bearer ").strip()
     if not tok: raise HTTPException(401)
     h = hashlib.sha256(tok.encode()).hexdigest()
-    # 开发态：未知token按hash独立建行（身份隔离——同一行被多token覆盖会让
-    # claimed_by归属校验失效，评审D2的竞态防护依赖节点身份唯一）
+    # 仅本地开发允许未知 token 自动建行；生产节点必须先通过共享密钥注册。
     node = db.query(m.GpuNode).filter_by(token_hash=h).first()
     if not node:
+        if os.getenv("NODE_STRICT_AUTH", "0") == "1":
+            raise HTTPException(401, "unknown node token")
         node = m.GpuNode(name=f"dev-node-{h[:8]}", token_hash=h, online=True)
         db.add(node); db.commit()
     elif not node.online:

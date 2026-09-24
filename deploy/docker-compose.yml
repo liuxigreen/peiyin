@@ -25,6 +25,7 @@ services:
       MODE_B_STORAGE: /srv/data/mode-b
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set an encryption key}
       NODE_SHARED_SECRET: ${NODE_SHARED_SECRET:?set a node join secret}
+      NODE_STRICT_AUTH: "1"
       NODE_ARTIFACT_MAX_MB: ${NODE_ARTIFACT_MAX_MB:-256}
       R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
       R2_ACCESS_KEY: ${R2_ACCESS_KEY:-}

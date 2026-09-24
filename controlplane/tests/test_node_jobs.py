@@ -72,6 +72,17 @@ def test_heartbeat_updates_validated_node_capabilities(app_client):
         db.close()
 
 
+def test_production_rejects_unknown_node_token(app_client, monkeypatch):
+    client, _ = app_client
+    monkeypatch.setenv("NODE_STRICT_AUTH", "1")
+    unknown = client.post("/api/nodes/heartbeat", headers={"Authorization": "Bearer arbitrary"})
+    assert unknown.status_code == 401
+
+    token = _register(client, "known-node")
+    known = client.post("/api/nodes/heartbeat", headers={"Authorization": f"Bearer {token}"})
+    assert known.status_code == 200
+
+
 def test_pipeline_claim_requires_node_capability(app_client):
     client, SessionLocal = app_client
     token = _register(client, "capability-node", ["tts"])
