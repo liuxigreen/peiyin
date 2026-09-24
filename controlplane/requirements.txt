@@ -6,6 +6,7 @@ alembic
 pydantic-settings
 cryptography          # provider api_key AES-GCM加密
 httpx
+boto3                 # Cloudflare R2 (S3 API) uploads and presigned URLs
 python-multipart      # 文件上传
 soundfile
 librosa               # 音节/时长/WSOLA计算侧
