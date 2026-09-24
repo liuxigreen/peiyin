@@ -399,6 +399,14 @@ def package_from_clips(pid: str, body: dict, db: Session = Depends(get_db)):
         {"id": pid, "name": p.name, "target_lang": p.target_lang},
         rows, out_dir, post=body.get("audio_post", True),
         me_path=body.get("me_path"))
+    if os.getenv("R2_ACCESS_KEY"):
+        from ..core.r2 import BUCKET, object_key, r2_client
+        key = object_key(pid, "mode-b", "package", os.path.basename(zip_path))
+        r2_client().upload_file(zip_path, BUCKET, key)
+        config = dict(p.config or {})
+        config["mode_b_package_r2_key"] = key
+        p.config = config
+        db.commit()
     n_clips = sum(1 for r in rows if r["audio_path"])
     return {"ok": True, "zip": zip_path, "clips": n_clips,
             "missing": len(rows) - n_clips,
@@ -412,6 +420,10 @@ def get_package(pid: str, db: Session = Depends(get_db)):
     p = db.get(Project, pid)
     if not p:
         raise HTTPException(404)
+    r2_key = (p.config or {}).get("mode_b_package_r2_key")
+    if r2_key:
+        return {"ok": True, "file": os.path.basename(r2_key),
+                "download_url": f"/api/projects/{pid}/mode-b/download"}
     pkg = os.path.join(STORAGE, pid[:8], "package")
     zips = [f for f in os.listdir(pkg) if f.endswith(".zip")] if os.path.isdir(pkg) else []
     if not zips:
@@ -422,11 +434,14 @@ def get_package(pid: str, db: Session = Depends(get_db)):
 
 @router.get("/projects/{pid}/mode-b/download")
 def download_package(pid: str, db: Session = Depends(get_db)):
-    import zipfile
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, RedirectResponse
     p = db.get(Project, pid)
     if not p:
         raise HTTPException(404)
+    r2_key = (p.config or {}).get("mode_b_package_r2_key")
+    if r2_key:
+        from ..core.r2 import presign_get
+        return RedirectResponse(presign_get(r2_key), status_code=307)
     pkg = os.path.join(STORAGE, pid[:8], "package")
     zips = [f for f in os.listdir(pkg) if f.endswith(".zip")] if os.path.isdir(pkg) else []
     if not zips:
