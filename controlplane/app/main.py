@@ -1,5 +1,6 @@
 """控制面入口（v0.3）：DB建表 + 全部路由挂载 + Web面板静态托管"""
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
@@ -54,6 +55,11 @@ app.include_router(mode_b_api.router)
 # Web面板构建产物静态托管（frontend/dist 拷贝到 controlplane/web/dist）
 # 挂在最后，且只匹配非 /api /docs 路径 —— SPA fallback用自定义异常处理
 _dist = Path(__file__).parent.parent / "web" / "dist"
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon():
+    return FileResponse(_dist / "favicon.svg", media_type="image/svg+xml")
 
 
 @app.exception_handler(404)
